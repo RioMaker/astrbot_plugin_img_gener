@@ -75,6 +75,12 @@
         "options": ["auto", "low", "medium", "high"],
         "hint": "high 通常更慢且更贵。"
       },
+      "start_message": {
+        "description": "开始生图提示语",
+        "type": "string",
+        "default": "已收到生图请求，正在检查额度并进行安全审核；审核通过后将立即生成，请稍候。",
+        "hint": "用于 /生图 的即时反馈和 LLM 工具受理结果；留空时使用默认提示语。"
+      },
       "prompt_prefix": {
         "description": "管理员提示词前缀",
         "type": "text",

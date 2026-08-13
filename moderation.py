@@ -25,7 +25,8 @@ DEFAULT_POLICY = """
 5. 仇恨煽动、恐怖主义宣传、鼓励自杀自残或严重违法行为；
 6. 伪造证件、隐私凭证、欺诈材料，或针对真实人物的严重诽谤与误导性图像。
 普通人物肖像、虚构角色、非露骨恋爱、泳装、医学/新闻/教育语境，以及非血腥动作场面可以通过。
-边界不清或无法可靠判断时拒绝。
+7. 政治人物、政党或政府宣传、选举动员、政治运动、政变分裂、领土主权争议等政治相关内容；
+8. 边界不清或无法可靠判断时拒绝。
 """.strip()
 
 
@@ -46,6 +47,16 @@ class PromptModerator:
     )
     _REAL_PERSON_ABUSE = re.compile(
         r"(真实人物|真人|同学|老师|同事|前任|网红|明星).{0,18}(裸照|色情|全裸|换脸|走光|性行为)",
+        re.I,
+    )
+    _POLITICAL_TERMS = re.compile(
+        r"(政治|国家领导人|领导人|总统|总理|首相|主席|总书记|政府|政党|党派|"
+        r"选举|投票|议会|国会|示威|抗议|革命|政变|分裂主义|独立运动|"
+        r"领土争端|主权争议|政治宣传|政治讽刺|国旗|党旗|"
+        r"\b(?:politics?|political|president|prime minister|head of state|government|"
+        r"political party|election|vote|parliament|congress|protest|revolution|coup|"
+        r"separatism|territorial dispute|sovereignty|political propaganda|"
+        r"political satire)\b)",
         re.I,
     )
 
@@ -81,6 +92,13 @@ class PromptModerator:
         if any(term in folded for term in self.blocked_terms):
             return ReviewResult(
                 False, "CUSTOM_BLOCKED_TERM", "请求命中了管理员设置的禁用规则。", "local"
+            )
+        if self._POLITICAL_TERMS.search(text):
+            return ReviewResult(
+                False,
+                "POLITICAL_CONTENT",
+                "不允许生成政治相关内容。",
+                "local",
             )
         if self._MINOR_TERMS.search(text) and self._SEXUAL_TERMS.search(text):
             return ReviewResult(

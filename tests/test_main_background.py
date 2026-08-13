@@ -64,6 +64,7 @@ def test_llm_tool_returns_before_background_generation_finishes() -> None:
         module = importlib.import_module("astrbot_plugin_img_gener.main")
         plugin = object.__new__(module.GPTImageGeneratorPlugin)
         plugin._background_tasks = set()
+        plugin.config = {"generation": {"start_message": "自定义受理话术"}}
         plugin._is_allowed = lambda event: True
         release = asyncio.Event()
 
@@ -86,7 +87,7 @@ def test_llm_tool_returns_before_background_generation_finishes() -> None:
 
         event = Event()
         result = await plugin.generate_image(event, "test prompt")
-        assert "任务已受理" in result
+        assert result == "自定义受理话术"
         await asyncio.sleep(0)
         assert len(plugin._background_tasks) == 1
         task = next(iter(plugin._background_tasks))
@@ -106,6 +107,7 @@ def test_draw_command_yields_progress_before_starting_generation() -> None:
         module = importlib.import_module("astrbot_plugin_img_gener.main")
         plugin = object.__new__(module.GPTImageGeneratorPlugin)
         calls = []
+        plugin.config = {"generation": {"start_message": "自定义开始反馈"}}
 
         async def fake_generate(event, prompt, **kwargs):
             del event, kwargs
@@ -129,7 +131,7 @@ def test_draw_command_yields_progress_before_starting_generation() -> None:
         progress = await anext(results)
 
         assert event.stopped
-        assert "正在检查额度并进行安全审核" in progress
+        assert progress == "自定义开始反馈"
         assert calls == []
 
         completed = await anext(results)
@@ -171,3 +173,14 @@ def test_remote_review_requires_a_configured_model() -> None:
 
     with pytest.raises(module.ConfigurationError):
         asyncio.run(plugin._remote_review(None, "safe prompt"))
+
+
+def test_duration_format_is_human_readable() -> None:
+    _install_astrbot_stubs()
+    sys.modules.pop("astrbot_plugin_img_gener.main", None)
+    module = importlib.import_module("astrbot_plugin_img_gener.main")
+
+    assert module.GPTImageGeneratorPlugin._format_duration(12.34) == "12.3 秒"
+    assert module.GPTImageGeneratorPlugin._format_duration(72.34) == (
+        "1 分 12.3 秒"
+    )

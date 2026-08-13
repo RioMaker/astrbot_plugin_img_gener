@@ -18,6 +18,7 @@ def test_configuration_schema_is_valid_json() -> None:
         "https://uuapi.shop/v1"
     )
     assert "review_api_key" in schema["safety"]["items"]
+    assert "start_message" in schema["generation"]["items"]
 
 
 def test_metadata_and_requirements_exist() -> None:
@@ -36,4 +37,5 @@ def test_local_api_keys_are_ignored() -> None:
 def test_llm_tool_uses_background_task() -> None:
     source = (ROOT / "main.py").read_text(encoding="utf-8")
     assert "asyncio.create_task(" in source
-    assert "生图任务已受理" in source
+    assert "_generation_start_message" in source
+    assert "总用时" in source

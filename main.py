@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import time
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +48,9 @@ except ImportError:  # pragma: no cover - direct script-style import fallback.
 
 
 PLUGIN_NAME = "astrbot_plugin_img_gener"
+DEFAULT_START_MESSAGE = (
+    "已收到生图请求，正在检查额度并进行安全审核；审核通过后将立即生成，请稍候。"
+)
 
 
 class GPTImageGeneratorPlugin(Star):
@@ -162,6 +166,25 @@ class GPTImageGeneratorPlugin(Star):
         self, *path: str, default: float, minimum: float | None = None
     ) -> float:
         return as_float(self._get(*path, default=default), default, minimum=minimum)
+
+    def _generation_start_message(self) -> str:
+        message = str(
+            self._get(
+                "generation",
+                "start_message",
+                default=DEFAULT_START_MESSAGE,
+            )
+            or ""
+        ).strip()
+        return message or DEFAULT_START_MESSAGE
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        total = max(0.0, seconds)
+        if total < 60:
+            return f"{total:.1f} 秒"
+        minutes, remaining = divmod(total, 60)
+        return f"{int(minutes)} 分 {remaining:.1f} 秒"
 
     def _client(self) -> OpenAICompatibleImageClient:
         return OpenAICompatibleImageClient(
@@ -318,6 +341,7 @@ class GPTImageGeneratorPlugin(Star):
         quality: str | None,
         characters: list[str] | None,
     ) -> None:
+        started_at = time.monotonic()
         try:
             message = await self._generate_image(
                 event,
@@ -325,6 +349,7 @@ class GPTImageGeneratorPlugin(Star):
                 size=size,
                 quality=quality,
                 characters=characters,
+                started_at=started_at,
             )
             await event.send(event.plain_result(message))
         except asyncio.CancelledError:
@@ -372,7 +397,9 @@ class GPTImageGeneratorPlugin(Star):
         size: str | None = None,
         quality: str | None = None,
         characters: list[str] | None = None,
+        started_at: float | None = None,
     ) -> str:
+        started_at = time.monotonic() if started_at is None else started_at
         if not self._is_allowed(event):
             return "生图功能未启用，或当前用户/群没有使用权限。"
 
@@ -465,7 +492,11 @@ class GPTImageGeneratorPlugin(Star):
                 if resolved.names
                 else ""
             )
-            return f"图片已通过审核并发送（{selected_size}，{selected_quality}）{reference_text}。"
+            duration = self._format_duration(time.monotonic() - started_at)
+            return (
+                f"图片已通过审核并发送（{selected_size}，{selected_quality}）"
+                f"{reference_text}。总用时：{duration}。"
+            )
         except ImageGeneratorError as exc:
             logger.warning("[img_gener] generation failed: %s", exc.detail[:800])
             return exc.public_message
@@ -509,20 +540,18 @@ class GPTImageGeneratorPlugin(Star):
             quality=quality,
             characters=characters,
         )
-        return (
-            "生图任务已受理，正在后台进行安全审核和生成；"
-            "完成后会直接发送到当前会话，请勿重复调用。"
-        )
+        return self._generation_start_message()
 
     @filter.command("生图", alias={"绘图", "draw"})
     async def draw_command(self, event: AstrMessageEvent, prompt: GreedyStr):
         """直接测试 GPT Image 2 生图；正常聊天也可由 LLM 自动调用。"""
 
         event.stop_event()
-        yield event.plain_result(
-            "已收到生图请求，正在检查额度并进行安全审核；审核通过后将立即生成，请稍候。"
+        started_at = time.monotonic()
+        yield event.plain_result(self._generation_start_message())
+        message = await self._generate_image(
+            event, str(prompt or ""), started_at=started_at
         )
-        message = await self._generate_image(event, str(prompt or ""))
         yield event.plain_result(message)
 
     @filter.command("生图人物", alias={"生图角色"})
