@@ -8,3 +8,6 @@ dist/
 build/
 *.sqlite3
 outputs/
+uuapi.key
+*.key
+.gitignore-secrets

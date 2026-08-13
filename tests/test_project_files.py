@@ -17,3 +17,15 @@ def test_metadata_and_requirements_exist() -> None:
     requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8")
     assert "name: astrbot_plugin_img_gener" in metadata
     assert "httpx" in requirements
+
+
+def test_local_api_keys_are_ignored() -> None:
+    ignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
+    assert "uuapi.key" in ignore
+    assert "*.key" in ignore
+
+
+def test_llm_tool_uses_background_task() -> None:
+    source = (ROOT / "main.py").read_text(encoding="utf-8")
+    assert "asyncio.create_task(" in source
+    assert "生图任务已受理" in source

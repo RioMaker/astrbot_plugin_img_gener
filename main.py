@@ -128,6 +128,7 @@ class GPTImageGeneratorPlugin(Star):
                 "storage", "retention_days", default=7, minimum=0
             ),
         )
+        self._background_tasks: set[asyncio.Task[None]] = set()
 
     async def initialize(self) -> None:
         removed = self.output_store.cleanup()
@@ -138,6 +139,13 @@ class GPTImageGeneratorPlugin(Star):
             len(self.references.characters),
             removed,
         )
+
+    async def terminate(self) -> None:
+        tasks = tuple(self._background_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def _get(self, *path: str, default: Any = None) -> Any:
         return get_config(self.config, *path, default=default)
@@ -279,6 +287,61 @@ class GPTImageGeneratorPlugin(Star):
         if self._bool("safety", "log_raw_prompt", default=False):
             logger.info("[img_gener] reviewed raw prompt=%s", prompt[:8000])
 
+    async def _run_background_generation(
+        self,
+        event: AstrMessageEvent,
+        prompt: str,
+        *,
+        size: str | None,
+        quality: str | None,
+        characters: list[str] | None,
+    ) -> None:
+        try:
+            message = await self._generate_image(
+                event,
+                prompt,
+                size=size,
+                quality=quality,
+                characters=characters,
+            )
+            await event.send(event.plain_result(message))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("[img_gener] background generation failed: %s", exc)
+            try:
+                await event.send(
+                    event.plain_result(
+                        "后台生图任务异常终止，请联系管理员查看日志。"
+                    )
+                )
+            except Exception:
+                logger.exception(
+                    "[img_gener] failed to send background task error"
+                )
+
+    def _start_background_generation(
+        self,
+        event: AstrMessageEvent,
+        prompt: str,
+        *,
+        size: str | None,
+        quality: str | None,
+        characters: list[str] | None,
+    ) -> None:
+        task = asyncio.create_task(
+            self._run_background_generation(
+                event,
+                prompt,
+                size=size,
+                quality=quality,
+                characters=characters,
+            ),
+            name=f"{PLUGIN_NAME}:generate_image",
+        )
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
     async def _generate_image(
         self,
         event: AstrMessageEvent,
@@ -292,6 +355,8 @@ class GPTImageGeneratorPlugin(Star):
             return "生图功能未启用，或当前用户/群没有使用权限。"
 
         raw_prompt = str(prompt or "").strip()
+        if not raw_prompt:
+            return "请提供需要生成的画面描述。"
         try:
             selected_size = self._normalize_size(size)
             selected_quality = self._normalize_quality(quality)
@@ -411,12 +476,20 @@ class GPTImageGeneratorPlugin(Star):
             quality(string): Optional quality: auto, low, medium, or high.
             characters(array): Optional configured character names; omit to auto-detect names and aliases from prompt.
         """  # noqa: E501
-        return await self._generate_image(
+        if not self._is_allowed(event):
+            return "生图功能未启用，或当前用户/群没有使用权限。"
+        if not str(prompt or "").strip():
+            return "请提供需要生成的画面描述。"
+        self._start_background_generation(
             event,
             prompt,
             size=size,
             quality=quality,
             characters=characters,
+        )
+        return (
+            "生图任务已受理，正在后台进行安全审核和生成；"
+            "完成后会直接发送到当前会话，请勿重复调用。"
         )
 
     @filter.command("生图", alias={"绘图", "draw"})

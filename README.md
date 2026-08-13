@@ -120,6 +120,11 @@ AstrBot/data/plugin_data/astrbot_plugin_img_gener/rate_limits.sqlite3
 generate_image(prompt=..., size="1024x1536", quality="medium")
 ```
 
+`generate_image` 会立即向 LLM 返回“任务已受理”，随后在后台完成安全审核、
+UUAPI 生图、图片下载和发送。这样不会让耗时的生图请求占满 AstrBot 的工具调用
+时限。AstrBot 的 `provider_settings.tool_call_timeout` 默认通常为 60 秒，而一次
+审核加参考图生成可能超过这个时间；插件的后台模式不依赖调大该值。
+
 插件也提供几个测试命令：
 
 ```text
@@ -127,6 +132,9 @@ generate_image(prompt=..., size="1024x1536", quality="medium")
 /生图人物
 /生图状态
 ```
+
+`/生图` 命令仍会同步等待结果，适合管理员排障。UUAPI 较忙时它可能等待数分钟，
+但不经过 LLM Tool 的 60 秒限制。
 
 如果聊天模型一直不调用工具，请先在 AstrBot WebUI 的 Tool 管理中确认 `generate_image` 已启用，并确认当前聊天模型支持 Function Calling。
 
