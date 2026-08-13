@@ -1,0 +1,12 @@
+name: astrbot_plugin_img_gener
+display_name: GPT Image 2 安全生图
+short_desc: 让 AstrBot 的 LLM 安全、限频地调用 UUAPI GPT Image 2，并自动携带人物参考图。
+desc: 通过 UUAPI 的 OpenAI-compatible Images API 提供经审核、按用户和群限流、支持固定人物参考图的 LLM 生图工具。
+version: "0.1.0"
+author: Rio
+repo: ""
+astrbot_version: ">=4.13.0"
+tags:
+  - image-generation
+  - gpt-image-2
+  - safety

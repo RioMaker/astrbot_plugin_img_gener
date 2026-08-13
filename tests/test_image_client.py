@@ -1,0 +1,77 @@
+from __future__ import annotations
+
+import asyncio
+import base64
+
+import pytest
+from astrbot_plugin_img_gener.errors import ImageAPIError
+from astrbot_plugin_img_gener.image_client import OpenAICompatibleImageClient
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"payload"
+
+
+def _client() -> OpenAICompatibleImageClient:
+    return OpenAICompatibleImageClient(
+        base_url="https://uuapi.net/v1",
+        api_key="test-key",
+        max_response_mb=1,
+    )
+
+
+def test_parse_b64_json_response() -> None:
+    payload = {"data": [{"b64_json": base64.b64encode(PNG).decode()}]}
+    result = asyncio.run(_client()._parse_image_response(payload))
+    assert result.content == PNG
+    assert result.media_type == "image/png"
+
+
+def test_parse_data_url_response() -> None:
+    encoded = base64.b64encode(PNG).decode()
+    payload = {"data": [{"b64_json": f"data:image/png;base64,{encoded}"}]}
+    result = asyncio.run(_client()._parse_image_response(payload))
+    assert result.extension == ".png"
+
+
+def test_rejects_non_image_base64() -> None:
+    payload = {"data": [{"b64_json": base64.b64encode(b"not an image").decode()}]}
+    with pytest.raises(ImageAPIError):
+        asyncio.run(_client()._parse_image_response(payload))
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "file:///etc/passwd",
+        "http://localhost/image.png",
+        "http://127.0.0.1/image.png",
+        "http://192.168.1.2/image.png",
+    ],
+)
+def test_rejects_unsafe_download_urls(url: str) -> None:
+    with pytest.raises(ImageAPIError):
+        _client()._validate_download_url(url)
+
+
+def test_generation_payload_matches_uuapi() -> None:
+    client = _client()
+    captured = {}
+
+    async def fake_post(path, payload, *, timeout=None):
+        captured["path"] = path
+        captured["payload"] = payload
+        return {"data": [{"b64_json": base64.b64encode(PNG).decode()}]}
+
+    client._post_json = fake_post  # type: ignore[method-assign]
+    result = asyncio.run(
+        client.generate("一只橘猫", size="1024x1024", quality="medium")
+    )
+    assert result.content == PNG
+    assert captured["path"] == "/images/generations"
+    assert captured["payload"] == {
+        "model": "gpt-image-2",
+        "prompt": "一只橘猫",
+        "n": 1,
+        "size": "1024x1024",
+        "response_format": "b64_json",
+        "quality": "medium",
+    }

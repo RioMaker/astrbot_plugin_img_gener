@@ -1,0 +1,319 @@
+{
+  "api": {
+    "description": "UUAPI 连接",
+    "type": "object",
+    "hint": "OpenAI-compatible Images API。默认按 https://uuapi.net/v1 配置。",
+    "items": {
+      "base_url": {
+        "description": "API Base URL",
+        "type": "string",
+        "default": "https://uuapi.net/v1",
+        "hint": "填写到 /v1；若省略 /v1，插件会自动补齐。"
+      },
+      "api_key": {
+        "description": "UUAPI API Key",
+        "type": "string",
+        "default": "",
+        "obvious_hint": true,
+        "hint": "可直接填写 sk-...，也可填写 $UUAPI_API_KEY 从环境变量读取。不要把真实密钥提交到 Git。"
+      },
+      "model": {
+        "description": "生图模型",
+        "type": "string",
+        "default": "gpt-image-2"
+      },
+      "timeout_seconds": {
+        "description": "生图超时（秒）",
+        "type": "int",
+        "default": 300,
+        "hint": "GPT Image 2 可能生成较久，建议不少于 180 秒。"
+      },
+      "edit_image_field": {
+        "description": "参考图上传字段",
+        "type": "string",
+        "default": "image",
+        "options": ["image", "image[]"],
+        "labels": ["image（UUAPI 默认）", "image[]（官方兼容）"],
+        "hint": "UUAPI 文档使用 image；若后续网关要求官方数组字段，可切换为 image[]。"
+      },
+      "user_agent": {
+        "description": "请求 User-Agent",
+        "type": "string",
+        "default": "AstrBot-ImageGenerator/0.1.0",
+        "collapsed": true,
+        "hint": "UUAPI 外接场景可能检查 User-Agent，不建议留空。"
+      },
+      "max_response_mb": {
+        "description": "单张返回图片大小上限（MB）",
+        "type": "int",
+        "default": 30,
+        "collapsed": true
+      }
+    }
+  },
+  "generation": {
+    "description": "生成参数",
+    "type": "object",
+    "items": {
+      "default_size": {
+        "description": "默认尺寸",
+        "type": "string",
+        "default": "1024x1024",
+        "options": ["auto", "1024x1024", "1024x1536", "1536x1024"]
+      },
+      "allowed_sizes": {
+        "description": "允许 LLM 选择的尺寸",
+        "type": "list",
+        "default": ["auto", "1024x1024", "1024x1536", "1536x1024"],
+        "items": {"type": "string"},
+        "hint": "限制工具参数，避免 LLM 提交昂贵或网关不支持的尺寸。"
+      },
+      "default_quality": {
+        "description": "默认质量",
+        "type": "string",
+        "default": "auto",
+        "options": ["auto", "low", "medium", "high"],
+        "hint": "high 通常更慢且更贵。"
+      },
+      "prompt_prefix": {
+        "description": "管理员提示词前缀",
+        "type": "text",
+        "default": "",
+        "hint": "会加入每次实际提交的提示词，也会一并经过安全审核。"
+      }
+    }
+  },
+  "safety": {
+    "description": "安全审核",
+    "type": "object",
+    "hint": "本地硬规则 + 独立 LLM 审核 + GPT Image 上游默认审核。默认审核失败即拒绝生图。",
+    "items": {
+      "enabled": {
+        "description": "启用 LLM 安全审核",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后仍保留本地硬规则。强烈建议保持开启。"
+      },
+      "fail_closed": {
+        "description": "审核故障时拒绝请求",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，审核模型超时或返回格式异常时不会继续生图。"
+      },
+      "review_model": {
+        "description": "UUAPI 审核模型",
+        "type": "string",
+        "default": "",
+        "hint": "留空使用当前 AstrBot 会话模型进行审核；填写 UUAPI 已开通的聊天模型 ID 后，改走同一 API Key 的 /v1/chat/completions。"
+      },
+      "review_timeout_seconds": {
+        "description": "审核超时（秒）",
+        "type": "int",
+        "default": 45
+      },
+      "blocked_terms": {
+        "description": "管理员禁用词",
+        "type": "list",
+        "default": [],
+        "items": {"type": "string"},
+        "hint": "命中即拒绝，不区分大小写。适合加入社区自定义禁区；不要用过短或歧义很大的词。"
+      },
+      "custom_policy": {
+        "description": "自定义审核政策",
+        "type": "text",
+        "default": "",
+        "hint": "留空使用内置政策；填写后会完全替换内置 LLM 审核政策，本地未成年人色情等硬规则不会被替换。"
+      },
+      "max_prompt_chars": {
+        "description": "提示词最大字符数",
+        "type": "int",
+        "default": 8000,
+        "collapsed": true
+      },
+      "log_raw_prompt": {
+        "description": "在日志记录原始提示词",
+        "type": "bool",
+        "default": false,
+        "collapsed": true,
+        "hint": "默认只记录提示词哈希、审核分类和调用者 ID。开启可能记录敏感内容。"
+      }
+    }
+  },
+  "limits": {
+    "description": "频率与配额",
+    "type": "object",
+    "hint": "调用频率按尝试计数；用户/群生图配额只按成功拿到图片计数。数据持久化到插件数据目录的 SQLite。",
+    "items": {
+      "user_cooldown_seconds": {
+        "description": "单用户最短调用间隔（秒）",
+        "type": "int",
+        "default": 60
+      },
+      "user_attempt_window_seconds": {
+        "description": "单用户调用统计窗口（秒）",
+        "type": "int",
+        "default": 600
+      },
+      "user_max_attempts": {
+        "description": "窗口内单用户最多调用次数",
+        "type": "int",
+        "default": 3,
+        "hint": "审核拒绝和生成失败也属于调用；0 表示不限制窗口次数，但最短间隔仍生效。"
+      },
+      "user_generation_window_seconds": {
+        "description": "单用户成功生图窗口（秒）",
+        "type": "int",
+        "default": 3600
+      },
+      "user_max_generations": {
+        "description": "窗口内单用户最多成功生图数",
+        "type": "int",
+        "default": 5,
+        "hint": "0 表示不限制。"
+      },
+      "group_cooldown_seconds": {
+        "description": "同群最短调用间隔（秒）",
+        "type": "int",
+        "default": 15
+      },
+      "group_generation_window_seconds": {
+        "description": "群成功生图统计窗口（秒）",
+        "type": "int",
+        "default": 3600
+      },
+      "group_max_generations": {
+        "description": "窗口内单群最多成功生图数",
+        "type": "int",
+        "default": 20,
+        "hint": "0 表示不限制；私聊不套用群配额。"
+      },
+      "global_max_concurrent": {
+        "description": "全局同时生成上限",
+        "type": "int",
+        "default": 2
+      },
+      "group_max_concurrent": {
+        "description": "单群同时生成上限",
+        "type": "int",
+        "default": 1
+      },
+      "admins_bypass_limits": {
+        "description": "管理员跳过用户/群配额",
+        "type": "bool",
+        "default": true,
+        "hint": "管理员仍受全局同时生成上限保护。"
+      }
+    }
+  },
+  "references": {
+    "description": "人物参考清单",
+    "type": "object",
+    "hint": "用户提示词提到人物名或别名时，插件自动改走 /v1/images/edits 并携带对应图片。",
+    "items": {
+      "characters": {
+        "description": "人物列表",
+        "type": "template_list",
+        "default": [],
+        "templates": {
+          "character": {
+            "name": "人物参考",
+            "hint": "为一个固定人物配置名称、别名和一张或多张参考图。",
+            "display_item": "name",
+            "hide_hint_in_list": true,
+            "items": {
+              "enabled": {
+                "description": "启用",
+                "type": "bool",
+                "default": true
+              },
+              "name": {
+                "description": "人物名称",
+                "type": "string",
+                "default": "",
+                "hint": "例如：可可子"
+              },
+              "aliases": {
+                "description": "别名",
+                "type": "list",
+                "default": [],
+                "items": {"type": "string"},
+                "hint": "例如：可可、Coco。过短的单字别名不会自动匹配。"
+              },
+              "reference_images": {
+                "description": "参考图片",
+                "type": "file",
+                "default": [],
+                "file_types": ["png", "jpg", "jpeg", "webp"],
+                "hint": "建议清晰正脸或角色设定图；可上传多张。"
+              },
+              "prompt_note": {
+                "description": "人物补充设定",
+                "type": "text",
+                "default": "",
+                "hint": "例如固定发色、服装或不要改变的特征。"
+              }
+            }
+          }
+        }
+      },
+      "strict_references": {
+        "description": "参考缺失时拒绝生图",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，提到已配置人物但其图片失效时不会退化成纯文生图。"
+      },
+      "max_reference_images": {
+        "description": "单次最多携带参考图",
+        "type": "int",
+        "default": 4
+      },
+      "max_image_size_mb": {
+        "description": "单张参考图大小上限（MB）",
+        "type": "int",
+        "default": 12
+      }
+    }
+  },
+  "access": {
+    "description": "使用权限",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用插件生图",
+        "type": "bool",
+        "default": true
+      },
+      "admin_only": {
+        "description": "仅管理员可用",
+        "type": "bool",
+        "default": false
+      },
+      "allowed_user_ids": {
+        "description": "用户白名单",
+        "type": "list",
+        "default": [],
+        "items": {"type": "string"},
+        "hint": "留空允许所有用户；填写平台 sender_id（如 QQ 号）后只允许清单内用户。"
+      },
+      "denied_group_ids": {
+        "description": "禁用群列表",
+        "type": "list",
+        "default": [],
+        "items": {"type": "string"},
+        "hint": "填写平台 group_id（如 QQ 群号）。"
+      }
+    }
+  },
+  "storage": {
+    "description": "本地存储",
+    "type": "object",
+    "items": {
+      "retention_days": {
+        "description": "生成图片保留天数",
+        "type": "int",
+        "default": 7,
+        "hint": "设为 0 不自动清理。频率限制数据库不会随图片清理。"
+      }
+    }
+  }
+}

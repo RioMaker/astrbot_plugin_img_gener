@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.research/
+.venv/
+dist/
+build/
+*.sqlite3
+outputs/

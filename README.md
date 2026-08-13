@@ -1,0 +1,158 @@
+# AstrBot GPT Image 2 安全生图
+
+这是一个让 AstrBot 的聊天 LLM 直接调用生图能力的插件。图片通过 [UUAPI](https://uuapi.net/docs) 的 OpenAI-compatible Images API 生成，默认模型为 `gpt-image-2`。
+
+插件的目标不是“收到提示词就无条件出图”，而是把生图做成一条有边界、可控成本的链路：
+
+1. LLM 仅在用户明确要求生图时调用 `generate_image` 工具。
+2. 插件先执行本地硬规则，再使用独立 LLM 审核提示词；审核异常默认拒绝。
+3. 用户调用频率、用户成功生图数、群成功生图数和并发任务分别限流。
+4. 提示词命中已配置人物名或别名时，自动携带管理员保存的参考图。
+5. 最后仍使用 GPT Image 服务自身的默认上游审核。
+
+## 环境要求
+
+- AstrBot `>= 4.13.0`。人物清单使用 `template_list`，图片上传使用插件配置的 `file` 类型。
+- Python 3.10+。
+- 一个可调用 `gpt-image-2` 的 UUAPI Key。
+- 当前 AstrBot 聊天模型应支持 Function Calling。
+
+## 安装
+
+将本仓库放入 AstrBot 的 `data/plugins/astrbot_plugin_img_gener`，或者在 AstrBot WebUI 的插件页通过仓库 URL/压缩包安装。插件管理器会读取 `requirements.txt` 安装 `httpx`。
+
+重载插件后，在插件设置里至少填写：
+
+```text
+UUAPI 连接 → API Base URL = https://uuapi.net/v1
+UUAPI 连接 → UUAPI API Key = sk-你的密钥
+UUAPI 连接 → 生图模型 = gpt-image-2
+```
+
+API Key 也可以写成 `$UUAPI_API_KEY`，然后在 AstrBot 进程环境中设置同名环境变量。这样不会把密钥明文保存在插件配置文件里。
+
+UUAPI 当前文档给出的同步接口是：
+
+- 文生图：`POST /v1/images/generations`，JSON 请求，优先读取 `data[0].b64_json`。
+- 参考图：`POST /v1/images/edits`，`multipart/form-data` 请求，图片字段名为 `image`。
+
+插件同时兼容 `data[0].url` 返回；URL 图片会先经过协议、私网地址和文件大小检查，再下载到插件数据目录。
+
+## 安全审核
+
+默认审核分三层：
+
+- 本地硬规则会直接拒绝未成年人色情、性暴力、真实人物色情侵害和管理员禁用词等明显请求。
+- LLM 审核器根据内置政策返回严格 JSON 判定。
+- GPT Image 上游默认的 `auto` 审核继续生效。
+
+“UUAPI 审核模型”留空时，插件通过 AstrBot 的当前聊天模型做独立审核调用。若填写一个当前 UUAPI Key 已开通的聊天模型 ID，审核会改走 UUAPI `/v1/chat/completions`。由于 UUAPI 文档目前没有公开 `/v1/moderations`，插件没有假设该端点一定存在。
+
+建议保持“审核故障时拒绝请求”开启。否则审核模型超时、网络故障或返回格式异常时会继续尝试生图，不适合公开群。
+
+管理员可在设置里追加：
+
+- `管理员禁用词`：命中即拒绝，适合社区自己的禁区。
+- `自定义审核政策`：替换内置的 LLM 审核政策。本地硬规则仍会保留。
+- `在日志记录原始提示词`：默认关闭；关闭时日志只记录提示词哈希、审核分类、用户 ID 和群 ID。
+
+审核能显著降低滥用，但不是法律或平台合规的替代品。公开部署前仍应根据所在地区、聊天平台规则和社区人群调整政策。
+
+## 用户和群限流
+
+限流数据保存在：
+
+```text
+AstrBot/data/plugin_data/astrbot_plugin_img_gener/rate_limits.sqlite3
+```
+
+实际根路径由 AstrBot 的 `get_astrbot_plugin_data_path()` 决定。重载插件或重启 AstrBot 不会重置配额。
+
+默认值：
+
+| 规则 | 默认值 | 计数语义 |
+|---|---:|---|
+| 单用户最短调用间隔 | 60 秒 | 每次被准入的调用 |
+| 单用户调用窗口 | 10 分钟最多 3 次 | 审核拒绝、上游失败也计入调用 |
+| 单用户成功生图 | 每小时 5 张 | 成功拿到合法图片才计数 |
+| 同群最短调用间隔 | 15 秒 | 群内所有用户共享 |
+| 单群成功生图 | 每小时 20 张 | 私聊不套用群配额 |
+| 单群并发 | 1 | 防止同群连续堆积任务 |
+| 全局并发 | 2 | 管理员也不能绕过 |
+
+插件使用 SQLite 事务和“生成中预留位”，因此两个同时到达的请求不能一起越过最后一个配额。上游真正返回图片后才提交成功生图计数；审核失败或 API 失败会释放预留位，但调用频率计数仍保留。
+
+所有数值都可在插件设置的“频率与配额”中修改。`最多成功生图数` 设为 `0` 表示关闭对应窗口配额。
+
+## 人物参考清单
+
+在插件设置中打开“人物参考清单 → 人物列表”，新增一个“人物参考”条目：
+
+```text
+人物名称：可可子
+别名：可可、Coco
+参考图片：上传 1～3 张清晰设定图
+人物补充设定：保持紫色短发和星形发夹；服装可按用户要求变化
+```
+
+再添加菌菌等其他人物即可。之后用户说“画一张可可子和菌菌在咖啡店聊天”，插件会：
+
+1. 从提示词自动匹配两个名字或别名；
+2. 按人物清单顺序收集可用参考图；
+3. 在提示词里标注每张图对应的人物；
+4. 使用 UUAPI `/v1/images/edits`，以重复的 `image` 字段上传参考图。
+
+默认最多携带 4 张参考图。提到已配置人物但图片丢失、过大或格式不支持时，`参考缺失时拒绝生图` 会阻止降级为纯文生图，避免生成一个外观完全不一致的角色。
+
+当前版本支持“管理员在插件设置中维护的固定人物参考图”。普通用户临时上传/引用任意图片作为参考图尚未开放，避免群成员通过大文件和任意图片绕过人物清单管理；后续可以在同一审核和限流链路上增加。
+
+## 使用方式
+
+正常聊天示例：
+
+```text
+帮我画一张可可子在雨后的车站撑透明伞的插画，竖图，中等质量。
+```
+
+聊天模型应自动调用：
+
+```text
+generate_image(prompt=..., size="1024x1536", quality="medium")
+```
+
+插件也提供几个测试命令：
+
+```text
+/生图 一只戴宇航头盔的橘猫，儿童绘本风格
+/生图人物
+/生图状态
+```
+
+如果聊天模型一直不调用工具，请先在 AstrBot WebUI 的 Tool 管理中确认 `generate_image` 已启用，并确认当前聊天模型支持 Function Calling。
+
+## 文件与模块
+
+```text
+main.py                  AstrBot Tool、命令和完整调用编排
+moderation.py            本地硬规则与 LLM 审核
+rate_limiter.py          SQLite 用户/群配额和并发预留
+character_references.py  人物清单解析、匹配和参考图校验
+image_client.py          UUAPI Images Generations/Edits 客户端
+storage.py               生成图片落盘和保留期清理
+_conf_schema.json        AstrBot WebUI 可视化配置
+```
+
+## 开发验证
+
+```powershell
+python -m pip install -r requirements.txt
+python -m pip install pytest ruff
+python -m pytest
+ruff check .
+```
+
+涉及真实 UUAPI 的端到端测试不会在单元测试中自动执行，避免意外扣费。建议先把配额调小，通过 `/生图` 做一张低质量测试图，再启用公开群。
+
+## 发布前
+
+`metadata.yaml` 的 `repo` 当前留空。发布到 AstrBot 插件市场前，请改成实际 GitHub 仓库 URL，并确认作者字段、许可证和版本号。
