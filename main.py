@@ -342,11 +342,13 @@ class GPTImageGeneratorPlugin(Star):
         return not (group_id and str(group_id) in denied_groups)
 
     def _normalize_size(self, size: str | None) -> str:
+        configured_default = str(
+            self._get("generation", "default_size", default=DEFAULT_IMAGE_SIZE)
+            or DEFAULT_IMAGE_SIZE
+        ).strip().lower().replace("×", "x")
         value = str(size or "").strip().lower().replace("×", "x")
         aliases = {
-            "": str(
-                self._get("generation", "default_size", default=DEFAULT_IMAGE_SIZE)
-            ),
+            "": configured_default,
             "小图": "816x816",
             "小方图": "816x816",
             "small": "816x816",
@@ -360,6 +362,7 @@ class GPTImageGeneratorPlugin(Star):
             "横图": "1536x1024",
             "landscape": "1536x1024",
         }
+        configured_default = aliases.get(configured_default, configured_default)
         value = aliases.get(value, value)
         allowed = as_string_list(
             self._get(
@@ -370,7 +373,7 @@ class GPTImageGeneratorPlugin(Star):
         )
         if allowed == list(LEGACY_ALLOWED_SIZES):
             allowed = list(DEFAULT_ALLOWED_SIZES)
-        if allowed and value not in allowed:
+        if allowed and value not in allowed and value != configured_default:
             raise ConfigurationError(
                 "不支持该图片尺寸，可选：" + "、".join(allowed[:12])
             )

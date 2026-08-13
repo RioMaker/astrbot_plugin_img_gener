@@ -318,7 +318,7 @@ def test_status_command_lists_active_jobs_with_elapsed_time() -> None:
     asyncio.run(scenario())
 
 
-def test_legacy_default_allowlist_accepts_new_small_default() -> None:
+def test_custom_legacy_allowlist_does_not_reject_configured_default() -> None:
     _install_astrbot_stubs()
     sys.modules.pop("astrbot_plugin_img_gener.main", None)
     module = importlib.import_module("astrbot_plugin_img_gener.main")
@@ -331,8 +331,17 @@ def test_legacy_default_allowlist_accepts_new_small_default() -> None:
                 "1024x1024",
                 "1024x1536",
                 "1536x1024",
+                "800x600",
+                "640x480",
             ],
         }
     }
 
     assert plugin._normalize_size(None) == "816x816"
+    assert plugin._normalize_size("816x816") == "816x816"
+
+    with pytest.raises(
+        module.ConfigurationError,
+        match="不支持该图片尺寸",
+    ):
+        plugin._normalize_size("1024x640")
