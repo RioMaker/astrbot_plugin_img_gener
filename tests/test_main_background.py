@@ -98,7 +98,7 @@ def test_llm_tool_returns_before_background_generation_finishes() -> None:
 
         event = Event()
         result = await plugin.generate_image(event, "test prompt")
-        assert result == "自定义受理话术"
+        assert result == "自定义受理话术\n本次尺寸：1024x1024"
         await asyncio.sleep(0)
         assert len(plugin._background_tasks) == 1
         task = next(iter(plugin._background_tasks))
@@ -163,7 +163,7 @@ def test_draw_command_yields_progress_and_continues_in_background() -> None:
         progress = await anext(results)
 
         assert event.stopped
-        assert progress == "自定义开始反馈"
+        assert progress == "自定义开始反馈\n本次尺寸：1024x1024"
         assert calls == []
         assert len(plugin._active_jobs) == 1
         with pytest.raises(StopAsyncIteration):
@@ -288,17 +288,62 @@ def test_status_command_lists_active_jobs_with_elapsed_time() -> None:
                 return message
 
         event = Event()
-        job_id, _ = plugin._register_job(event, source="LLM")
+        job_id, _ = plugin._register_job(event, source="LLM", size="1024x1536")
         plugin._active_jobs[job_id].started_at -= 65
         plugin._set_job_stage(job_id, "生成图片")
 
         results = plugin.status_command(event)
         message = await anext(results)
 
-        assert "【任务池 / 队列】" in message
-        assert "全局任务：1 个" in message
+        assert "【队列】" in message
+        assert "全局：1 个" in message
+        assert "【任务】" in message
+        assert "1024x1536" in message
         assert "生成图片" in message
         assert "已用 1 分" in message
-        assert "【我的配额】" in message
+        assert "【配额】" in message
+        assert "服务配置" not in message
+        assert "密钥" not in message
+        assert "审核模型" not in message
+        assert "生图接口" not in message
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("command", "expected_size", "expected_prompt"),
+    [
+        ("竖图 一只猫", "1024x1536", "一只猫"),
+        ("横图：海边日落", "1536x1024", "海边日落"),
+        ("方图, 机器人头像", "1024x1024", "机器人头像"),
+        ("--size=1024x1536 城市夜景", "1024x1536", "城市夜景"),
+        ("尺寸 1536x1024 山谷", "1536x1024", "山谷"),
+    ],
+)
+def test_draw_command_size_parser(
+    command: str, expected_size: str, expected_prompt: str
+) -> None:
+    _install_astrbot_stubs()
+    sys.modules.pop("astrbot_plugin_img_gener.main", None)
+    module = importlib.import_module("astrbot_plugin_img_gener.main")
+    plugin = object.__new__(module.GPTImageGeneratorPlugin)
+    plugin.config = {}
+
+    size, prompt = plugin._parse_command_size(command)
+
+    assert size == expected_size
+    assert prompt == expected_prompt
+
+
+def test_draw_command_rejects_disallowed_explicit_size() -> None:
+    _install_astrbot_stubs()
+    sys.modules.pop("astrbot_plugin_img_gener.main", None)
+    module = importlib.import_module("astrbot_plugin_img_gener.main")
+    plugin = object.__new__(module.GPTImageGeneratorPlugin)
+    plugin.config = {}
+
+    with pytest.raises(
+        module.ConfigurationError,
+        match="不支持该图片尺寸",
+    ):
+        plugin._parse_command_size("--size=512x512 一只猫")

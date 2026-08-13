@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -61,6 +62,7 @@ class ActiveGenerationJob:
     group_id: str | None
     source: str
     started_at: float
+    size: str = "1024x1024"
     stage: str = "等待调度"
 
 
@@ -181,7 +183,7 @@ class GPTImageGeneratorPlugin(Star):
     ) -> float:
         return as_float(self._get(*path, default=default), default, minimum=minimum)
 
-    def _generation_start_message(self) -> str:
+    def _generation_start_message(self, size: str) -> str:
         message = str(
             self._get(
                 "generation",
@@ -190,7 +192,7 @@ class GPTImageGeneratorPlugin(Star):
             )
             or ""
         ).strip()
-        return message or DEFAULT_START_MESSAGE
+        return f"{message or DEFAULT_START_MESSAGE}\n本次尺寸：{size}"
 
     @staticmethod
     def _format_duration(seconds: float) -> str:
@@ -213,7 +215,7 @@ class GPTImageGeneratorPlugin(Star):
         return f"{used}/不限" if maximum <= 0 else f"{used}/{maximum}"
 
     def _register_job(
-        self, event: AstrMessageEvent, *, source: str
+        self, event: AstrMessageEvent, *, source: str, size: str
     ) -> tuple[int, float]:
         self._next_job_id += 1
         user_id, group_id = self._identity(event)
@@ -224,6 +226,7 @@ class GPTImageGeneratorPlugin(Star):
             group_id=group_id,
             source=source,
             started_at=started_at,
+            size=size,
         )
         self._active_jobs[job.job_id] = job
         return job.job_id, started_at
@@ -354,6 +357,31 @@ class GPTImageGeneratorPlugin(Star):
             )
         return value
 
+    def _parse_command_size(self, value: str) -> tuple[str, str]:
+        text = str(value or "").strip()
+        size_token = (
+            r"auto|方图|正方形|square|竖图|portrait|横图|landscape|"
+            r"1024[x×]1024|1024[x×]1536|1536[x×]1024"
+        )
+        explicit = re.match(
+            r"^(?:--?size|尺寸)\s*(?:=|:|：|\s)\s*([^\s,，:：]+)"
+            r"(?:\s+|[,，:：]\s*)?(.*)$",
+            text,
+            re.I,
+        )
+        leading = re.match(
+            rf"^[\[【]?({size_token})[\]】]?(?:\s+|[,，:：]\s*)(.*)$",
+            text,
+            re.I,
+        )
+        matched = explicit or leading
+        if matched:
+            selected_size = self._normalize_size(matched.group(1))
+            return selected_size, matched.group(2).strip()
+        if re.fullmatch(rf"[\[【]?({size_token})[\]】]?", text, re.I):
+            return self._normalize_size(text.strip("[]【】")), ""
+        return self._normalize_size(None), text
+
     def _normalize_quality(self, quality: str | None) -> str:
         value = str(
             quality
@@ -406,7 +434,7 @@ class GPTImageGeneratorPlugin(Star):
         event: AstrMessageEvent,
         prompt: str,
         *,
-        size: str | None,
+        size: str,
         quality: str | None,
         characters: list[str] | None,
         job_id: int,
@@ -445,12 +473,12 @@ class GPTImageGeneratorPlugin(Star):
         event: AstrMessageEvent,
         prompt: str,
         *,
-        size: str | None,
+        size: str,
         quality: str | None,
         characters: list[str] | None,
         source: str,
     ) -> None:
-        job_id, started_at = self._register_job(event, source=source)
+        job_id, started_at = self._register_job(event, source=source, size=size)
         try:
             task = asyncio.create_task(
                 self._run_background_generation(
@@ -619,22 +647,30 @@ class GPTImageGeneratorPlugin(Star):
             return "生图功能未启用，或当前用户/群没有使用权限。"
         if not str(prompt or "").strip():
             return "请提供需要生成的画面描述。"
+        try:
+            selected_size = self._normalize_size(size)
+        except ImageGeneratorError as exc:
+            return exc.public_message
         self._start_background_generation(
             event,
             prompt,
-            size=size,
+            size=selected_size,
             quality=quality,
             characters=characters,
             source="LLM",
         )
-        return self._generation_start_message()
+        return self._generation_start_message(selected_size)
 
     @filter.command("生图", alias={"绘图", "draw"})
     async def draw_command(self, event: AstrMessageEvent, prompt: GreedyStr):
         """直接测试 GPT Image 2 生图；正常聊天也可由 LLM 自动调用。"""
 
         event.stop_event()
-        raw_prompt = str(prompt or "").strip()
+        try:
+            selected_size, raw_prompt = self._parse_command_size(str(prompt or ""))
+        except ImageGeneratorError as exc:
+            yield event.plain_result(exc.public_message)
+            return
         if not self._is_allowed(event):
             yield event.plain_result(
                 "生图功能未启用，或当前用户/群没有使用权限。"
@@ -646,12 +682,12 @@ class GPTImageGeneratorPlugin(Star):
         self._start_background_generation(
             event,
             raw_prompt,
-            size=None,
+            size=selected_size,
             quality=None,
             characters=None,
             source="/生图",
         )
-        yield event.plain_result(self._generation_start_message())
+        yield event.plain_result(self._generation_start_message(selected_size))
 
     @filter.command("生图人物", alias={"生图角色"})
     async def character_list_command(self, event: AstrMessageEvent):
@@ -673,65 +709,39 @@ class GPTImageGeneratorPlugin(Star):
 
     @filter.command("生图状态", alias={"生图配额"})
     async def status_command(self, event: AstrMessageEvent):
-        """查看任务池、当前用户与群聊配额以及基础配置状态。"""
+        """查看队列、当前任务以及用户和群聊配额。"""
 
         event.stop_event()
         user_id, group_id = self._identity(event)
         status = await self.rate_limiter.status(user_id, group_id)
         pool = self._active_job_snapshot(user_id, group_id)
         limits = self.rate_limiter.limits
-        api_key_configured = bool(
-            str(self._get("api", "api_key", default="") or "").strip()
-        )
-        review_key_configured = bool(
-            str(self._get("safety", "review_api_key", default="") or "").strip()
-        )
-        review_model = str(
-            self._get("safety", "review_model", default="") or "未配置"
-        )
-        fail_mode = "故障即拒绝" if self.moderator.fail_closed else "故障时放行"
-        safety_text = (
-            f"独立 LLM 审核（{fail_mode}）"
-            if self.moderator.enabled
-            else "仅本地硬规则"
-        )
         lines = [
-            "🎨 生图服务状态",
+            "🎨 生图状态",
             "",
-            "【服务配置】",
-            f"• 生图模型：{self._get('api', 'model', default='gpt-image-2')}",
-            f"• 生图接口：{self._get('api', 'base_url', default='https://uuapi.cc/v1')}",
-            f"• 生图密钥：{'已配置' if api_key_configured else '未配置'}",
-            f"• 安全审核：{safety_text}",
-            f"• 审核模型：{review_model}",
-            f"• 审核密钥：{'已配置' if review_key_configured else '未配置'}",
-            f"• 人物参考：{len(self.references.characters)} 个",
-            "",
-            "【任务池 / 队列】",
-            f"• 全局任务：{pool['global']} 个",
-            f"• 并发槽占用：{status['global_inflight']}/{limits.global_max_concurrent}",
-            f"• 我的任务：{pool['user']} 个",
+            "【队列】",
+            f"• 全局：{pool['global']} 个"
+            f"（并发 {status['global_inflight']}/{limits.global_max_concurrent}）",
+            f"• 我的：{pool['user']} 个",
         ]
         if group_id:
-            lines.append(
-                f"• 本群任务：{pool['group']}/{limits.group_max_concurrent}"
-            )
+            lines.append(f"• 本群：{pool['group']}/{limits.group_max_concurrent}")
 
+        lines.extend(["", "【任务】"])
         visible_jobs: list[ActiveGenerationJob] = pool["visible"]
         if visible_jobs:
-            lines.extend(["", "【当前任务】"])
             now = time.monotonic()
             for job in visible_jobs[:8]:
                 owner = "我的" if job.user_id == user_id else "本群"
                 elapsed = self._format_duration(now - job.started_at)
                 lines.append(
-                    f"• #{job.job_id:04d}｜{owner}｜{job.source}｜"
+                    f"• #{job.job_id:04d}｜{owner}｜{job.source}｜{job.size}｜"
                     f"{job.stage}｜已用 {elapsed}"
                 )
             if len(visible_jobs) > 8:
                 lines.append(f"• 另有 {len(visible_jobs) - 8} 个任务未展开")
         else:
-            lines.append("• 当前用户/群暂无等待或处理中的任务")
+            lines.append("• 暂无等待或处理中的任务")
 
         user_attempts = self._format_quota(
             status["user_attempts"], limits.user_max_attempts
@@ -739,27 +749,23 @@ class GPTImageGeneratorPlugin(Star):
         user_generations = self._format_quota(
             status["user_generations"], limits.user_max_generations
         )
-        group_generations = self._format_quota(
-            status["group_generations"], limits.group_max_generations
-        )
         lines.extend(
             [
                 "",
-                "【我的配额】",
-                f"• 调用次数：{user_attempts}"
+                "【配额】",
+                f"• 我的调用：{user_attempts}"
                 f" · {self._format_window(limits.user_attempt_window_seconds)}窗口",
-                f"• 成功生图：{user_generations}"
+                f"• 我的生图：{user_generations}"
                 f" · {self._format_window(limits.user_generation_window_seconds)}窗口",
             ]
         )
         if group_id:
-            lines.extend(
-                [
-                    "",
-                    "【本群配额】",
-                    f"• 成功生图：{group_generations}"
-                    f" · {self._format_window(limits.group_generation_window_seconds)}窗口",
-                ]
+            group_generations = self._format_quota(
+                status["group_generations"], limits.group_max_generations
+            )
+            lines.append(
+                f"• 本群生图：{group_generations}"
+                f" · {self._format_window(limits.group_generation_window_seconds)}窗口"
             )
         yield event.plain_result("\n".join(lines))
 
