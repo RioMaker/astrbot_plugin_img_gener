@@ -124,13 +124,20 @@ def test_draw_command_yields_progress_and_continues_in_background() -> None:
         plugin._next_job_id = 0
         plugin._is_allowed = lambda event: True
         calls = []
+        options = []
         release = asyncio.Event()
-        plugin.config = {"generation": {"start_message": "自定义开始反馈"}}
+        plugin.config = {
+            "generation": {
+                "start_message": "自定义开始反馈",
+                "default_size": "640x1024",
+            }
+        }
 
         async def fake_generate(event, prompt, **kwargs):
-            del event, kwargs
+            del event
             await release.wait()
             calls.append(prompt)
+            options.append(kwargs)
             return "生成完成"
 
         plugin._generate_image = fake_generate
@@ -159,11 +166,11 @@ def test_draw_command_yields_progress_and_continues_in_background() -> None:
                 self.sent.append(message)
 
         event = Event()
-        results = plugin.draw_command(event, "test prompt")
+        results = plugin.draw_command(event, "竖图 一只猫")
         progress = await anext(results)
 
         assert event.stopped
-        assert progress == "自定义开始反馈\n本次尺寸：816x816"
+        assert progress == "自定义开始反馈\n本次尺寸：640x1024"
         assert calls == []
         assert len(plugin._active_jobs) == 1
         with pytest.raises(StopAsyncIteration):
@@ -173,7 +180,8 @@ def test_draw_command_yields_progress_and_continues_in_background() -> None:
         assert not task.done()
         release.set()
         await task
-        assert calls == ["test prompt"]
+        assert calls == ["竖图 一只猫"]
+        assert options[0]["size"] == "640x1024"
         assert event.sent == ["生成完成"]
         assert plugin._active_jobs == {}
 
@@ -308,48 +316,6 @@ def test_status_command_lists_active_jobs_with_elapsed_time() -> None:
         assert "生图接口" not in message
 
     asyncio.run(scenario())
-
-
-@pytest.mark.parametrize(
-    ("command", "expected_size", "expected_prompt"),
-    [
-        ("小图 一只猫", "816x816", "一只猫"),
-        ("小竖图：人物立绘", "640x1024", "人物立绘"),
-        ("小横图, 山谷", "1024x640", "山谷"),
-        ("竖图 一只猫", "1024x1536", "一只猫"),
-        ("横图：海边日落", "1536x1024", "海边日落"),
-        ("方图, 机器人头像", "1024x1024", "机器人头像"),
-        ("--size=1024x1536 城市夜景", "1024x1536", "城市夜景"),
-        ("尺寸 1536x1024 山谷", "1536x1024", "山谷"),
-    ],
-)
-def test_draw_command_size_parser(
-    command: str, expected_size: str, expected_prompt: str
-) -> None:
-    _install_astrbot_stubs()
-    sys.modules.pop("astrbot_plugin_img_gener.main", None)
-    module = importlib.import_module("astrbot_plugin_img_gener.main")
-    plugin = object.__new__(module.GPTImageGeneratorPlugin)
-    plugin.config = {}
-
-    size, prompt = plugin._parse_command_size(command)
-
-    assert size == expected_size
-    assert prompt == expected_prompt
-
-
-def test_draw_command_rejects_disallowed_explicit_size() -> None:
-    _install_astrbot_stubs()
-    sys.modules.pop("astrbot_plugin_img_gener.main", None)
-    module = importlib.import_module("astrbot_plugin_img_gener.main")
-    plugin = object.__new__(module.GPTImageGeneratorPlugin)
-    plugin.config = {}
-
-    with pytest.raises(
-        module.ConfigurationError,
-        match="不支持该图片尺寸",
-    ):
-        plugin._parse_command_size("--size=512x512 一只猫")
 
 
 def test_legacy_default_allowlist_accepts_new_small_default() -> None:

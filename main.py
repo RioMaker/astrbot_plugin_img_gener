@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -377,33 +376,6 @@ class GPTImageGeneratorPlugin(Star):
             )
         return value
 
-    def _parse_command_size(self, value: str) -> tuple[str, str]:
-        text = str(value or "").strip()
-        size_token = (
-            r"auto|小图|小方图|small|小竖图|小横图|"
-            r"方图|正方形|square|竖图|portrait|横图|landscape|"
-            r"816[x×]816|640[x×]1024|1024[x×]640|1024[x×]1024|"
-            r"1024[x×]1536|1536[x×]1024"
-        )
-        explicit = re.match(
-            r"^(?:--?size|尺寸)\s*(?:=|:|：|\s)\s*([^\s,，:：]+)"
-            r"(?:\s+|[,，:：]\s*)?(.*)$",
-            text,
-            re.I,
-        )
-        leading = re.match(
-            rf"^[\[【]?({size_token})[\]】]?(?:\s+|[,，:：]\s*)(.*)$",
-            text,
-            re.I,
-        )
-        matched = explicit or leading
-        if matched:
-            selected_size = self._normalize_size(matched.group(1))
-            return selected_size, matched.group(2).strip()
-        if re.fullmatch(rf"[\[【]?({size_token})[\]】]?", text, re.I):
-            return self._normalize_size(text.strip("[]【】")), ""
-        return self._normalize_size(None), text
-
     def _normalize_quality(self, quality: str | None) -> str:
         value = str(
             quality
@@ -688,8 +660,9 @@ class GPTImageGeneratorPlugin(Star):
         """直接测试 GPT Image 2 生图；正常聊天也可由 LLM 自动调用。"""
 
         event.stop_event()
+        raw_prompt = str(prompt or "").strip()
         try:
-            selected_size, raw_prompt = self._parse_command_size(str(prompt or ""))
+            selected_size = self._normalize_size(None)
         except ImageGeneratorError as exc:
             yield event.plain_result(exc.public_message)
             return
