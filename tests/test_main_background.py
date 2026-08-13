@@ -68,6 +68,7 @@ def test_llm_tool_returns_before_background_generation_finishes() -> None:
         plugin._next_job_id = 0
         plugin.config = {"generation": {"start_message": "自定义受理话术"}}
         plugin._is_allowed = lambda event: True
+        plugin.moderator = module.PromptModerator(enabled=False)
         release = asyncio.Event()
 
         async def fake_generate(event, prompt, **kwargs):
@@ -123,6 +124,7 @@ def test_draw_command_yields_progress_and_continues_in_background() -> None:
         plugin._active_jobs = {}
         plugin._next_job_id = 0
         plugin._is_allowed = lambda event: True
+        plugin.moderator = module.PromptModerator(enabled=False)
         calls = []
         options = []
         release = asyncio.Event()
@@ -184,6 +186,88 @@ def test_draw_command_yields_progress_and_continues_in_background() -> None:
         assert options[0]["size"] == "640x1024"
         assert event.sent == ["生成完成"]
         assert plugin._active_jobs == {}
+
+    asyncio.run(scenario())
+
+
+def test_draw_command_rejects_blocked_term_before_feedback_or_queue() -> None:
+    async def scenario() -> None:
+        _install_astrbot_stubs()
+        sys.modules.pop("astrbot_plugin_img_gener.main", None)
+        module = importlib.import_module("astrbot_plugin_img_gener.main")
+        plugin = object.__new__(module.GPTImageGeneratorPlugin)
+        plugin._background_tasks = set()
+        plugin._active_jobs = {}
+        plugin._next_job_id = 0
+        plugin._is_allowed = lambda event: True
+        plugin.config = {"generation": {"default_size": "816x816"}}
+        plugin.moderator = module.PromptModerator(
+            enabled=True,
+            blocked_terms=["禁用画风"],
+        )
+        canceled = []
+
+        class Limiter:
+            async def acquire(self, user_id, group_id, *, bypass_limits=False):
+                assert user_id == "qq:3"
+                assert group_id == "qq:100"
+                assert bypass_limits is False
+                return types.SimpleNamespace(
+                    allowed=True,
+                    lease_id="local-review-lease",
+                )
+
+            async def cancel(self, lease_id):
+                canceled.append(lease_id)
+
+        plugin.rate_limiter = Limiter()
+
+        class Event:
+            def __init__(self):
+                self.stopped = False
+
+            def get_platform_name(self):
+                return "qq"
+
+            def get_sender_id(self):
+                return "3"
+
+            def get_group_id(self):
+                return "100"
+
+            def is_admin(self):
+                return False
+
+            def stop_event(self):
+                self.stopped = True
+
+            def plain_result(self, message):
+                return message
+
+        event = Event()
+        results = plugin.draw_command(event, "请使用禁用画风画一只猫")
+        response = await anext(results)
+
+        assert event.stopped
+        assert "CUSTOM_BLOCKED_TERM" in response
+        assert "管理员设置的禁用规则" in response
+        assert "正在" not in response
+        assert "本次尺寸" not in response
+        assert plugin._active_jobs == {}
+        assert plugin._background_tasks == set()
+        assert canceled == ["local-review-lease"]
+        with pytest.raises(StopAsyncIteration):
+            await anext(results)
+
+        llm_response = await plugin.generate_image(
+            event,
+            "也请使用禁用画风画一只狗",
+        )
+        assert "CUSTOM_BLOCKED_TERM" in llm_response
+        assert "正在" not in llm_response
+        assert "本次尺寸" not in llm_response
+        assert plugin._active_jobs == {}
+        assert canceled == ["local-review-lease", "local-review-lease"]
 
     asyncio.run(scenario())
 

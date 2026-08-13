@@ -411,7 +411,7 @@ class GPTImageGeneratorPlugin(Star):
         *,
         allowed: bool,
         code: str,
-        references: ResolvedReferences,
+        references: ResolvedReferences | None,
     ) -> None:
         digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:16]
         logger.info(
@@ -421,10 +421,39 @@ class GPTImageGeneratorPlugin(Star):
             digest,
             event.get_sender_id(),
             event.get_group_id() or "private",
-            ",".join(references.names) or "none",
+            ",".join(references.names) if references and references.names else "none",
         )
         if self._bool("safety", "log_raw_prompt", default=False):
             logger.info("[img_gener] reviewed raw prompt=%s", prompt[:8000])
+
+    async def _preflight_local_review(
+        self, event: AstrMessageEvent, prompt: str
+    ) -> str | None:
+        """Reject local hard-rule matches before announcing or queuing a task."""
+
+        review = self.moderator.local_review(prompt)
+        if review.allowed:
+            return None
+
+        user_id, group_id = self._identity(event)
+        bypass_limits = bool(
+            event.is_admin()
+            and self._bool("limits", "admins_bypass_limits", default=True)
+        )
+        rate = await self.rate_limiter.acquire(
+            user_id, group_id, bypass_limits=bypass_limits
+        )
+        if not rate.allowed:
+            return rate.message
+        await self.rate_limiter.cancel(rate.lease_id)
+        self._log_review(
+            event,
+            prompt,
+            allowed=False,
+            code=review.code,
+            references=None,
+        )
+        return f"请求未通过安全审核（{review.code}）：{review.reason}"
 
     async def _run_background_generation(
         self,
@@ -648,6 +677,9 @@ class GPTImageGeneratorPlugin(Star):
             selected_size = self._normalize_size(size)
         except ImageGeneratorError as exc:
             return exc.public_message
+        local_rejection = await self._preflight_local_review(event, str(prompt).strip())
+        if local_rejection:
+            return local_rejection
         self._start_background_generation(
             event,
             prompt,
@@ -676,6 +708,10 @@ class GPTImageGeneratorPlugin(Star):
             return
         if not raw_prompt:
             yield event.plain_result("请提供需要生成的画面描述。")
+            return
+        local_rejection = await self._preflight_local_review(event, raw_prompt)
+        if local_rejection:
+            yield event.plain_result(local_rejection)
             return
         self._start_background_generation(
             event,
