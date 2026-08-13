@@ -53,6 +53,17 @@ PLUGIN_NAME = "astrbot_plugin_img_gener"
 DEFAULT_START_MESSAGE = (
     "已收到生图请求，正在检查额度并进行安全审核；审核通过后将立即生成，请稍候。"
 )
+DEFAULT_IMAGE_SIZE = "816x816"
+DEFAULT_ALLOWED_SIZES = (
+    "auto",
+    "816x816",
+    "640x1024",
+    "1024x640",
+    "1024x1024",
+    "1024x1536",
+    "1536x1024",
+)
+LEGACY_ALLOWED_SIZES = ("auto", "1024x1024", "1024x1536", "1536x1024")
 
 
 @dataclass(slots=True)
@@ -62,7 +73,7 @@ class ActiveGenerationJob:
     group_id: str | None
     source: str
     started_at: float
-    size: str = "1024x1024"
+    size: str = DEFAULT_IMAGE_SIZE
     stage: str = "等待调度"
 
 
@@ -334,7 +345,14 @@ class GPTImageGeneratorPlugin(Star):
     def _normalize_size(self, size: str | None) -> str:
         value = str(size or "").strip().lower().replace("×", "x")
         aliases = {
-            "": str(self._get("generation", "default_size", default="1024x1024")),
+            "": str(
+                self._get("generation", "default_size", default=DEFAULT_IMAGE_SIZE)
+            ),
+            "小图": "816x816",
+            "小方图": "816x816",
+            "small": "816x816",
+            "小竖图": "640x1024",
+            "小横图": "1024x640",
             "方图": "1024x1024",
             "正方形": "1024x1024",
             "square": "1024x1024",
@@ -348,9 +366,11 @@ class GPTImageGeneratorPlugin(Star):
             self._get(
                 "generation",
                 "allowed_sizes",
-                default=["auto", "1024x1024", "1024x1536", "1536x1024"],
+                default=DEFAULT_ALLOWED_SIZES,
             )
         )
+        if allowed == list(LEGACY_ALLOWED_SIZES):
+            allowed = list(DEFAULT_ALLOWED_SIZES)
         if allowed and value not in allowed:
             raise ConfigurationError(
                 "不支持该图片尺寸，可选：" + "、".join(allowed[:12])
@@ -360,8 +380,10 @@ class GPTImageGeneratorPlugin(Star):
     def _parse_command_size(self, value: str) -> tuple[str, str]:
         text = str(value or "").strip()
         size_token = (
-            r"auto|方图|正方形|square|竖图|portrait|横图|landscape|"
-            r"1024[x×]1024|1024[x×]1536|1536[x×]1024"
+            r"auto|小图|小方图|small|小竖图|小横图|"
+            r"方图|正方形|square|竖图|portrait|横图|landscape|"
+            r"816[x×]816|640[x×]1024|1024[x×]640|1024[x×]1024|"
+            r"1024[x×]1536|1536[x×]1024"
         )
         explicit = re.match(
             r"^(?:--?size|尺寸)\s*(?:=|:|：|\s)\s*([^\s,，:：]+)"
@@ -639,7 +661,7 @@ class GPTImageGeneratorPlugin(Star):
 
         Args:
             prompt(string): Complete visual description for the requested image.
-            size(string): Optional output size: auto, 1024x1024, 1024x1536, or 1536x1024.
+            size(string): Optional allowed output size; use 816x816 for a small fast square draft.
             quality(string): Optional quality: auto, low, medium, or high.
             characters(array): Optional configured character names; omit to auto-detect names and aliases from prompt.
         """  # noqa: E501

@@ -98,7 +98,7 @@ def test_llm_tool_returns_before_background_generation_finishes() -> None:
 
         event = Event()
         result = await plugin.generate_image(event, "test prompt")
-        assert result == "自定义受理话术\n本次尺寸：1024x1024"
+        assert result == "自定义受理话术\n本次尺寸：816x816"
         await asyncio.sleep(0)
         assert len(plugin._background_tasks) == 1
         task = next(iter(plugin._background_tasks))
@@ -163,7 +163,7 @@ def test_draw_command_yields_progress_and_continues_in_background() -> None:
         progress = await anext(results)
 
         assert event.stopped
-        assert progress == "自定义开始反馈\n本次尺寸：1024x1024"
+        assert progress == "自定义开始反馈\n本次尺寸：816x816"
         assert calls == []
         assert len(plugin._active_jobs) == 1
         with pytest.raises(StopAsyncIteration):
@@ -313,6 +313,9 @@ def test_status_command_lists_active_jobs_with_elapsed_time() -> None:
 @pytest.mark.parametrize(
     ("command", "expected_size", "expected_prompt"),
     [
+        ("小图 一只猫", "816x816", "一只猫"),
+        ("小竖图：人物立绘", "640x1024", "人物立绘"),
+        ("小横图, 山谷", "1024x640", "山谷"),
         ("竖图 一只猫", "1024x1536", "一只猫"),
         ("横图：海边日落", "1536x1024", "海边日落"),
         ("方图, 机器人头像", "1024x1024", "机器人头像"),
@@ -347,3 +350,23 @@ def test_draw_command_rejects_disallowed_explicit_size() -> None:
         match="不支持该图片尺寸",
     ):
         plugin._parse_command_size("--size=512x512 一只猫")
+
+
+def test_legacy_default_allowlist_accepts_new_small_default() -> None:
+    _install_astrbot_stubs()
+    sys.modules.pop("astrbot_plugin_img_gener.main", None)
+    module = importlib.import_module("astrbot_plugin_img_gener.main")
+    plugin = object.__new__(module.GPTImageGeneratorPlugin)
+    plugin.config = {
+        "generation": {
+            "default_size": "816x816",
+            "allowed_sizes": [
+                "auto",
+                "1024x1024",
+                "1024x1536",
+                "1536x1024",
+            ],
+        }
+    }
+
+    assert plugin._normalize_size(None) == "816x816"
