@@ -1,13 +1,13 @@
 {
   "api": {
-    "description": "UUAPI 连接",
+    "description": "生图 API",
     "type": "object",
-    "hint": "OpenAI-compatible Images API。默认按 https://uuapi.net/v1 配置。",
+    "hint": "OpenAI-compatible Images API。默认使用 https://uuapi.cc/v1。",
     "items": {
       "base_url": {
         "description": "API Base URL",
         "type": "string",
-        "default": "https://uuapi.net/v1",
+        "default": "https://uuapi.cc/v1",
         "hint": "填写到 /v1；若省略 /v1，插件会自动补齐。"
       },
       "api_key": {
@@ -39,7 +39,7 @@
       "user_agent": {
         "description": "请求 User-Agent",
         "type": "string",
-        "default": "AstrBot-ImageGenerator/0.1.0",
+        "default": "AstrBot-ImageGenerator/0.1.4",
         "collapsed": true,
         "hint": "UUAPI 外接场景可能检查 User-Agent，不建议留空。"
       },
@@ -86,7 +86,7 @@
   "safety": {
     "description": "安全审核",
     "type": "object",
-    "hint": "本地硬规则 + 独立 LLM 审核 + GPT Image 上游默认审核。默认审核失败即拒绝生图。",
+    "hint": "本地硬规则 + 独立审核 API + GPT Image 上游审核。审核默认使用 https://uuapi.shop/v1，故障时拒绝生图。",
     "items": {
       "enabled": {
         "description": "启用 LLM 安全审核",
@@ -100,11 +100,24 @@
         "default": true,
         "hint": "开启后，审核模型超时或返回格式异常时不会继续生图。"
       },
+      "review_base_url": {
+        "description": "审核 API Base URL",
+        "type": "string",
+        "default": "https://uuapi.shop/v1",
+        "hint": "仅用于安全审核的 OpenAI-compatible /chat/completions 地址，与生图地址相互独立。"
+      },
+      "review_api_key": {
+        "description": "审核 API Key",
+        "type": "string",
+        "default": "",
+        "obvious_hint": true,
+        "hint": "仅发送给审核 API；可直接填写，也可填写 $UUAPI_REVIEW_API_KEY 从环境变量读取。"
+      },
       "review_model": {
         "description": "UUAPI 审核模型",
         "type": "string",
         "default": "",
-        "hint": "留空使用当前 AstrBot 会话模型进行审核；填写 UUAPI 已开通的聊天模型 ID 后，改走同一 API Key 的 /v1/chat/completions。"
+        "hint": "填写审核站已开通的聊天模型 ID；启用 LLM 审核时不能为空。"
       },
       "review_timeout_seconds": {
         "description": "审核超时（秒）",

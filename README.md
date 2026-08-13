@@ -1,6 +1,6 @@
 # AstrBot GPT Image 2 安全生图
 
-这是一个让 AstrBot 的聊天 LLM 直接调用生图能力的插件。图片通过 [UUAPI](https://uuapi.net/docs) 的 OpenAI-compatible Images API 生成，默认模型为 `gpt-image-2`。
+这是一个让 AstrBot 的聊天 LLM 直接调用生图能力的插件。图片通过 [UUAPI](https://uuapi.cc/docs) 的 OpenAI-compatible Images API 生成，默认模型为 `gpt-image-2`。
 
 插件的目标不是“收到提示词就无条件出图”，而是把生图做成一条有边界、可控成本的链路：
 
@@ -14,7 +14,7 @@
 
 - AstrBot `>= 4.13.0`。人物清单使用 `template_list`，图片上传使用插件配置的 `file` 类型。
 - Python 3.10+。
-- 一个可调用 `gpt-image-2` 的 UUAPI Key。
+- 一个可调用 `gpt-image-2` 的生图 Key，以及一个可调用聊天模型的独立审核 Key。
 - 当前 AstrBot 聊天模型应支持 Function Calling。
 
 ## 安装
@@ -24,12 +24,16 @@
 重载插件后，在插件设置里至少填写：
 
 ```text
-UUAPI 连接 → API Base URL = https://uuapi.net/v1
-UUAPI 连接 → UUAPI API Key = sk-你的密钥
-UUAPI 连接 → 生图模型 = gpt-image-2
+生图 API → API Base URL = https://uuapi.cc/v1
+生图 API → UUAPI API Key = sk-你的密钥
+生图 API → 生图模型 = gpt-image-2
+安全审核 → 审核 API Base URL = https://uuapi.shop/v1
+安全审核 → 审核 API Key = sk-你的审核密钥
+安全审核 → UUAPI 审核模型 = 你在审核站已开通的聊天模型 ID
 ```
 
-API Key 也可以写成 `$UUAPI_API_KEY`，然后在 AstrBot 进程环境中设置同名环境变量。这样不会把密钥明文保存在插件配置文件里。
+两个 API Key 都可写成 `$环境变量名`。例如生图填写 `$UUAPI_IMAGE_API_KEY`、审核
+填写 `$UUAPI_REVIEW_API_KEY`，避免把密钥明文保存在插件配置文件中。
 
 UUAPI 当前文档给出的同步接口是：
 
@@ -46,7 +50,9 @@ UUAPI 当前文档给出的同步接口是：
 - LLM 审核器根据内置政策返回严格 JSON 判定。
 - GPT Image 上游默认的 `auto` 审核继续生效。
 
-“UUAPI 审核模型”留空时，插件通过 AstrBot 的当前聊天模型做独立审核调用。若填写一个当前 UUAPI Key 已开通的聊天模型 ID，审核会改走 UUAPI `/v1/chat/completions`。由于 UUAPI 文档目前没有公开 `/v1/moderations`，插件没有假设该端点一定存在。
+LLM 审核固定走独立的 OpenAI-compatible `/chat/completions`，默认地址为
+`https://uuapi.shop/v1`，使用独立审核 Key，绝不会把生图 Key 发给审核站。启用 LLM
+审核时必须填写审核模型 ID；插件不会回退到 AstrBot 当前聊天模型。
 
 建议保持“审核故障时拒绝请求”开启。否则审核模型超时、网络故障或返回格式异常时会继续尝试生图，不适合公开群。
 
@@ -133,8 +139,9 @@ UUAPI 生图、图片下载和发送。这样不会让耗时的生图请求占�
 /生图状态
 ```
 
-`/生图` 命令仍会同步等待结果，适合管理员排障。UUAPI 较忙时它可能等待数分钟，
-但不经过 LLM Tool 的 60 秒限制。
+`/生图` 命令收到请求后会立即反馈“正在检查额度并进行安全审核”，随后同步等待并
+发送图片或明确的失败原因，不会只显示为加入队列。它适合管理员排障；UUAPI 较忙时
+可能等待数分钟，但不经过 LLM Tool 的 60 秒限制。
 
 如果聊天模型一直不调用工具，请先在 AstrBot WebUI 的 Tool 管理中确认 `generate_image` 已启用，并确认当前聊天模型支持 Function Calling。
 

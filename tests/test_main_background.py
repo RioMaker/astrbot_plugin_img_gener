@@ -5,6 +5,8 @@ import importlib
 import sys
 import types
 
+import pytest
+
 
 def _install_astrbot_stubs() -> None:
     astrbot = types.ModuleType("astrbot")
@@ -95,3 +97,77 @@ def test_llm_tool_returns_before_background_generation_finishes() -> None:
         assert event.sent == ["后台完成"]
 
     asyncio.run(scenario())
+
+
+def test_draw_command_yields_progress_before_starting_generation() -> None:
+    async def scenario() -> None:
+        _install_astrbot_stubs()
+        sys.modules.pop("astrbot_plugin_img_gener.main", None)
+        module = importlib.import_module("astrbot_plugin_img_gener.main")
+        plugin = object.__new__(module.GPTImageGeneratorPlugin)
+        calls = []
+
+        async def fake_generate(event, prompt, **kwargs):
+            del event, kwargs
+            calls.append(prompt)
+            return "生成完成"
+
+        plugin._generate_image = fake_generate
+
+        class Event:
+            def __init__(self):
+                self.stopped = False
+
+            def stop_event(self):
+                self.stopped = True
+
+            def plain_result(self, message):
+                return message
+
+        event = Event()
+        results = plugin.draw_command(event, "test prompt")
+        progress = await anext(results)
+
+        assert event.stopped
+        assert "正在检查额度并进行安全审核" in progress
+        assert calls == []
+
+        completed = await anext(results)
+        assert completed == "生成完成"
+        assert calls == ["test prompt"]
+        with pytest.raises(StopAsyncIteration):
+            await anext(results)
+
+    asyncio.run(scenario())
+
+
+def test_review_client_uses_separate_endpoint_and_key() -> None:
+    _install_astrbot_stubs()
+    sys.modules.pop("astrbot_plugin_img_gener.main", None)
+    module = importlib.import_module("astrbot_plugin_img_gener.main")
+    plugin = object.__new__(module.GPTImageGeneratorPlugin)
+    plugin.config = {
+        "api": {"api_key": "image-key"},
+        "safety": {
+            "review_base_url": "https://uuapi.shop/v1",
+            "review_api_key": "review-key",
+            "review_model": "review-model",
+        },
+    }
+
+    client = plugin._review_client()
+
+    assert client.base_url == "https://uuapi.shop/v1"
+    assert client.api_key == "review-key"
+    assert client.api_key != plugin.config["api"]["api_key"]
+
+
+def test_remote_review_requires_a_configured_model() -> None:
+    _install_astrbot_stubs()
+    sys.modules.pop("astrbot_plugin_img_gener.main", None)
+    module = importlib.import_module("astrbot_plugin_img_gener.main")
+    plugin = object.__new__(module.GPTImageGeneratorPlugin)
+    plugin.config = {"safety": {"review_model": ""}}
+
+    with pytest.raises(module.ConfigurationError):
+        asyncio.run(plugin._remote_review(None, "safe prompt"))

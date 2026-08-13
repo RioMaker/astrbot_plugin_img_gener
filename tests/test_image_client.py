@@ -12,7 +12,7 @@ PNG = b"\x89PNG\r\n\x1a\n" + b"payload"
 
 def _client() -> OpenAICompatibleImageClient:
     return OpenAICompatibleImageClient(
-        base_url="https://uuapi.net/v1",
+        base_url="https://uuapi.cc/v1",
         api_key="test-key",
         max_response_mb=1,
     )

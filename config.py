@@ -61,7 +61,7 @@ def as_string_list(value: Any) -> list[str]:
 
 
 def normalize_base_url(value: Any) -> str:
-    base_url = str(value or "https://uuapi.net/v1").strip().rstrip("/")
+    base_url = str(value or "https://uuapi.cc/v1").strip().rstrip("/")
     if not base_url.startswith(("https://", "http://")):
         raise ConfigurationError("生图 API 地址必须以 http:// 或 https:// 开头。")
     if not base_url.endswith("/v1"):

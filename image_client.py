@@ -5,6 +5,7 @@ import binascii
 import ipaddress
 import json
 import mimetypes
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -40,7 +41,7 @@ class OpenAICompatibleImageClient:
         model: str = "gpt-image-2",
         timeout_seconds: float = 300,
         max_response_mb: int = 30,
-        user_agent: str = "AstrBot-ImageGenerator/0.1.0",
+        user_agent: str = "AstrBot-ImageGenerator/0.1.4",
         edit_image_field: str = "image",
     ) -> None:
         self.base_url = base_url.rstrip("/")
@@ -74,17 +75,39 @@ class OpenAICompatibleImageClient:
             return response.text[:800]
 
     async def _post_json(
-        self, path: str, payload: dict[str, object], *, timeout: float | None = None
+        self,
+        path: str,
+        payload: dict[str, object],
+        *,
+        timeout: float | None = None,
+        operation: str = "生图服务",
     ) -> dict[str, object]:
+        configured_timeout = (
+            self.timeout_seconds if timeout is None else max(5.0, timeout)
+        )
+        started = time.monotonic()
         try:
             async with httpx.AsyncClient(
-                headers=self._headers(), timeout=self._timeout(timeout), follow_redirects=True
+                headers=self._headers(),
+                timeout=self._timeout(timeout),
+                follow_redirects=True,
             ) as client:
                 response = await client.post(f"{self.base_url}{path}", json=payload)
         except httpx.TimeoutException as exc:
-            raise ImageAPIError("生图服务响应超时，请稍后重试。", detail=str(exc)) from exc
+            elapsed = time.monotonic() - started
+            raise ImageAPIError(
+                f"{operation}响应超时（已等待约 {elapsed:.0f} 秒，"
+                f"配置上限 {configured_timeout:.0f} 秒）。",
+                detail=(
+                    f"operation={operation} path={path} elapsed={elapsed:.2f}s "
+                    f"limit={configured_timeout:.2f}s error={type(exc).__name__}: {exc}"
+                ),
+            ) from exc
         except httpx.HTTPError as exc:
-            raise ImageAPIError("无法连接生图服务，请检查 UUAPI 地址和网络。", detail=str(exc)) from exc  # noqa: E501
+            raise ImageAPIError(
+                f"无法连接{operation}，请检查 UUAPI 地址和网络。",
+                detail=f"operation={operation} path={path} error={type(exc).__name__}: {exc}",
+            ) from exc
         if response.status_code >= 400:
             detail = self._error_detail(response)
             if response.status_code in {401, 403}:
@@ -92,16 +115,18 @@ class OpenAICompatibleImageClient:
             elif response.status_code == 429:
                 message = "UUAPI 当前限流或额度不足，请稍后重试。"
             elif response.status_code in {400, 422}:
-                message = "生图服务拒绝了请求，可能是参数不兼容或内容未通过上游审核。"
+                message = f"{operation}拒绝了请求，可能是参数不兼容或内容未通过上游审核。"
             else:
-                message = f"生图服务返回错误（HTTP {response.status_code}）。"
+                message = f"{operation}返回错误（HTTP {response.status_code}）。"
             raise ImageAPIError(message, detail=detail)
         try:
             data = response.json()
         except json.JSONDecodeError as exc:
-            raise ImageAPIError("生图服务返回了无法解析的响应。", detail=response.text[:500]) from exc  # noqa: E501
+            raise ImageAPIError(
+                f"{operation}返回了无法解析的响应。", detail=response.text[:500]
+            ) from exc
         if not isinstance(data, dict):
-            raise ImageAPIError("生图服务返回格式不正确。")
+            raise ImageAPIError(f"{operation}返回格式不正确。")
         return data
 
     async def generate(self, prompt: str, *, size: str, quality: str) -> ImageResponse:
@@ -139,6 +164,7 @@ class OpenAICompatibleImageClient:
         for path in image_paths:
             media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
             files.append((self.edit_image_field, (path.name, path.read_bytes(), media_type)))
+        started = time.monotonic()
         try:
             async with httpx.AsyncClient(
                 headers=self._headers(), timeout=self._timeout(), follow_redirects=True
@@ -147,9 +173,20 @@ class OpenAICompatibleImageClient:
                     f"{self.base_url}/images/edits", data=form_data, files=files
                 )
         except httpx.TimeoutException as exc:
-            raise ImageAPIError("参考图生图响应超时，请稍后重试。", detail=str(exc)) from exc
+            elapsed = time.monotonic() - started
+            raise ImageAPIError(
+                f"参考图生图响应超时（已等待约 {elapsed:.0f} 秒，"
+                f"配置上限 {self.timeout_seconds:.0f} 秒）。",
+                detail=(
+                    f"operation=参考图生图 path=/images/edits elapsed={elapsed:.2f}s "
+                    f"limit={self.timeout_seconds:.2f}s error={type(exc).__name__}: {exc}"
+                ),
+            ) from exc
         except httpx.HTTPError as exc:
-            raise ImageAPIError("无法连接参考图生图服务。", detail=str(exc)) from exc
+            raise ImageAPIError(
+                "无法连接参考图生图服务。",
+                detail=f"operation=参考图生图 path=/images/edits error={type(exc).__name__}: {exc}",
+            ) from exc
         if response.status_code >= 400:
             raise ImageAPIError(
                 "参考图生图请求失败；请检查图片格式、上传字段和上游内容审核。",
@@ -173,7 +210,10 @@ class OpenAICompatibleImageClient:
             "messages": [{"role": "user", "content": prompt}],
         }
         data = await self._post_json(
-            "/chat/completions", payload, timeout=timeout_seconds
+            "/chat/completions",
+            payload,
+            timeout=timeout_seconds,
+            operation="安全审核服务",
         )
         try:
             content = data["choices"][0]["message"]["content"]  # type: ignore[index]

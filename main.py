@@ -135,7 +135,7 @@ class GPTImageGeneratorPlugin(Star):
         logger.info(
             "[img_gener] initialized model=%s base_url=%s references=%s cleaned=%s",
             self._get("api", "model", default="gpt-image-2"),
-            normalize_base_url(self._get("api", "base_url", default="https://uuapi.net/v1")),
+            normalize_base_url(self._get("api", "base_url", default="https://uuapi.cc/v1")),
             len(self.references.characters),
             removed,
         )
@@ -166,7 +166,7 @@ class GPTImageGeneratorPlugin(Star):
     def _client(self) -> OpenAICompatibleImageClient:
         return OpenAICompatibleImageClient(
             base_url=normalize_base_url(
-                self._get("api", "base_url", default="https://uuapi.net/v1")
+                self._get("api", "base_url", default="https://uuapi.cc/v1")
             ),
             api_key=resolve_secret(self._get("api", "api_key", default="")),
             model=str(self._get("api", "model", default="gpt-image-2") or "gpt-image-2"),
@@ -180,13 +180,36 @@ class GPTImageGeneratorPlugin(Star):
                 self._get(
                     "api",
                     "user_agent",
-                    default="AstrBot-ImageGenerator/0.1.0",
+                    default="AstrBot-ImageGenerator/0.1.4",
                 )
-                or "AstrBot-ImageGenerator/0.1.0"
+                or "AstrBot-ImageGenerator/0.1.4"
             ),
             edit_image_field=str(
                 self._get("api", "edit_image_field", default="image") or "image"
             ),
+        )
+
+    def _review_client(self) -> OpenAICompatibleImageClient:
+        review_model = str(
+            self._get("safety", "review_model", default="") or ""
+        ).strip()
+        return OpenAICompatibleImageClient(
+            base_url=normalize_base_url(
+                self._get(
+                    "safety",
+                    "review_base_url",
+                    default="https://uuapi.shop/v1",
+                )
+            ),
+            api_key=resolve_secret(
+                self._get("safety", "review_api_key", default="")
+            ),
+            model=review_model or "review-model-not-configured",
+            timeout_seconds=self._float(
+                "safety", "review_timeout_seconds", default=45, minimum=5
+            ),
+            max_response_mb=1,
+            user_agent="AstrBot-ImageGenerator/0.1.4",
         )
 
     @staticmethod
@@ -249,21 +272,20 @@ class GPTImageGeneratorPlugin(Star):
             raise ConfigurationError("图片质量只支持 auto、low、medium 或 high。")
         return value
 
-    async def _remote_review(self, event: AstrMessageEvent, prompt: str) -> str:
+    async def _remote_review(self, _event: AstrMessageEvent, prompt: str) -> str:
         timeout = self._float("safety", "review_timeout_seconds", default=45, minimum=5)
         review_model = str(self._get("safety", "review_model", default="") or "").strip()
-        if review_model:
-            return await self._client().chat_completion(
+        if not review_model:
+            raise ConfigurationError(
+                "启用 LLM 安全审核时必须配置独立的审核模型 ID。"
+            )
+        try:
+            return await self._review_client().chat_completion(
                 review_model, prompt, timeout_seconds=timeout
             )
-        provider_id = await self.context.get_current_chat_provider_id(
-            umo=event.unified_msg_origin
-        )
-        response = await asyncio.wait_for(
-            self.context.llm_generate(chat_provider_id=provider_id, prompt=prompt),
-            timeout=timeout,
-        )
-        return str(getattr(response, "completion_text", "") or response)
+        except ImageGeneratorError as exc:
+            logger.warning("[img_gener] safety review failed: %s", exc.detail[:800])
+            raise
 
     def _log_review(
         self,
@@ -497,6 +519,9 @@ class GPTImageGeneratorPlugin(Star):
         """直接测试 GPT Image 2 生图；正常聊天也可由 LLM 自动调用。"""
 
         event.stop_event()
+        yield event.plain_result(
+            "已收到生图请求，正在检查额度并进行安全审核；审核通过后将立即生成，请稍候。"
+        )
         message = await self._generate_image(event, str(prompt or ""))
         yield event.plain_result(message)
 

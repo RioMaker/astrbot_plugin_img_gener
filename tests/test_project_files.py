@@ -11,6 +11,14 @@ def test_configuration_schema_is_valid_json() -> None:
     assert schema["api"]["items"]["model"]["default"] == "gpt-image-2"
     assert schema["references"]["items"]["characters"]["type"] == "template_list"
 
+    assert schema["api"]["items"]["base_url"]["default"] == (
+        "https://uuapi.cc/v1"
+    )
+    assert schema["safety"]["items"]["review_base_url"]["default"] == (
+        "https://uuapi.shop/v1"
+    )
+    assert "review_api_key" in schema["safety"]["items"]
+
 
 def test_metadata_and_requirements_exist() -> None:
     metadata = (ROOT / "metadata.yaml").read_text(encoding="utf-8")
