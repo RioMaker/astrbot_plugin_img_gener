@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +52,16 @@ PLUGIN_NAME = "astrbot_plugin_img_gener"
 DEFAULT_START_MESSAGE = (
     "已收到生图请求，正在检查额度并进行安全审核；审核通过后将立即生成，请稍候。"
 )
+
+
+@dataclass(slots=True)
+class ActiveGenerationJob:
+    job_id: int
+    user_id: str
+    group_id: str | None
+    source: str
+    started_at: float
+    stage: str = "等待调度"
 
 
 class GPTImageGeneratorPlugin(Star):
@@ -133,6 +144,8 @@ class GPTImageGeneratorPlugin(Star):
             ),
         )
         self._background_tasks: set[asyncio.Task[None]] = set()
+        self._active_jobs: dict[int, ActiveGenerationJob] = {}
+        self._next_job_id = 0
 
     async def initialize(self) -> None:
         removed = self.output_store.cleanup()
@@ -150,6 +163,7 @@ class GPTImageGeneratorPlugin(Star):
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        self._active_jobs.clear()
 
     def _get(self, *path: str, default: Any = None) -> Any:
         return get_config(self.config, *path, default=default)
@@ -185,6 +199,61 @@ class GPTImageGeneratorPlugin(Star):
             return f"{total:.1f} 秒"
         minutes, remaining = divmod(total, 60)
         return f"{int(minutes)} 分 {remaining:.1f} 秒"
+
+    @staticmethod
+    def _format_window(seconds: int) -> str:
+        if seconds >= 3600 and seconds % 3600 == 0:
+            return f"{seconds // 3600} 小时"
+        if seconds >= 60 and seconds % 60 == 0:
+            return f"{seconds // 60} 分钟"
+        return f"{seconds} 秒"
+
+    @staticmethod
+    def _format_quota(used: int, maximum: int) -> str:
+        return f"{used}/不限" if maximum <= 0 else f"{used}/{maximum}"
+
+    def _register_job(
+        self, event: AstrMessageEvent, *, source: str
+    ) -> tuple[int, float]:
+        self._next_job_id += 1
+        user_id, group_id = self._identity(event)
+        started_at = time.monotonic()
+        job = ActiveGenerationJob(
+            job_id=self._next_job_id,
+            user_id=user_id,
+            group_id=group_id,
+            source=source,
+            started_at=started_at,
+        )
+        self._active_jobs[job.job_id] = job
+        return job.job_id, started_at
+
+    def _set_job_stage(self, job_id: int | None, stage: str) -> None:
+        if job_id is not None and job_id in self._active_jobs:
+            self._active_jobs[job_id].stage = stage
+
+    def _finish_job(self, job_id: int | None) -> None:
+        if job_id is not None:
+            self._active_jobs.pop(job_id, None)
+
+    def _active_job_snapshot(
+        self, user_id: str, group_id: str | None
+    ) -> dict[str, Any]:
+        jobs = sorted(self._active_jobs.values(), key=lambda job: job.started_at)
+        visible = [
+            job
+            for job in jobs
+            if job.user_id == user_id
+            or (group_id is not None and job.group_id == group_id)
+        ]
+        return {
+            "global": len(jobs),
+            "user": sum(job.user_id == user_id for job in jobs),
+            "group": sum(
+                group_id is not None and job.group_id == group_id for job in jobs
+            ),
+            "visible": visible,
+        }
 
     def _client(self) -> OpenAICompatibleImageClient:
         return OpenAICompatibleImageClient(
@@ -340,8 +409,9 @@ class GPTImageGeneratorPlugin(Star):
         size: str | None,
         quality: str | None,
         characters: list[str] | None,
+        job_id: int,
+        started_at: float,
     ) -> None:
-        started_at = time.monotonic()
         try:
             message = await self._generate_image(
                 event,
@@ -350,6 +420,7 @@ class GPTImageGeneratorPlugin(Star):
                 quality=quality,
                 characters=characters,
                 started_at=started_at,
+                job_id=job_id,
             )
             await event.send(event.plain_result(message))
         except asyncio.CancelledError:
@@ -366,6 +437,8 @@ class GPTImageGeneratorPlugin(Star):
                 logger.exception(
                     "[img_gener] failed to send background task error"
                 )
+        finally:
+            self._finish_job(job_id)
 
     def _start_background_generation(
         self,
@@ -375,17 +448,25 @@ class GPTImageGeneratorPlugin(Star):
         size: str | None,
         quality: str | None,
         characters: list[str] | None,
+        source: str,
     ) -> None:
-        task = asyncio.create_task(
-            self._run_background_generation(
-                event,
-                prompt,
-                size=size,
-                quality=quality,
-                characters=characters,
-            ),
-            name=f"{PLUGIN_NAME}:generate_image",
-        )
+        job_id, started_at = self._register_job(event, source=source)
+        try:
+            task = asyncio.create_task(
+                self._run_background_generation(
+                    event,
+                    prompt,
+                    size=size,
+                    quality=quality,
+                    characters=characters,
+                    job_id=job_id,
+                    started_at=started_at,
+                ),
+                name=f"{PLUGIN_NAME}:generate_image",
+            )
+        except Exception:
+            self._finish_job(job_id)
+            raise
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
@@ -398,8 +479,10 @@ class GPTImageGeneratorPlugin(Star):
         quality: str | None = None,
         characters: list[str] | None = None,
         started_at: float | None = None,
+        job_id: int | None = None,
     ) -> str:
         started_at = time.monotonic() if started_at is None else started_at
+        self._set_job_stage(job_id, "检查权限与配额")
         if not self._is_allowed(event):
             return "生图功能未启用，或当前用户/群没有使用权限。"
 
@@ -443,6 +526,7 @@ class GPTImageGeneratorPlugin(Star):
             return rate.message
 
         lease_active = True
+        self._set_job_stage(job_id, "安全审核")
         try:
             review = await self.moderator.review(
                 effective_prompt,
@@ -457,6 +541,7 @@ class GPTImageGeneratorPlugin(Star):
             )
             if not review.allowed:
                 return f"请求未通过安全审核（{review.code}）：{review.reason}"
+            self._set_job_stage(job_id, "生成图片")
 
             client = self._client()
             if resolved.image_paths:
@@ -476,6 +561,7 @@ class GPTImageGeneratorPlugin(Star):
             await self.rate_limiter.complete(rate.lease_id)
             lease_active = False
             output_path = self.output_store.save(generated)
+            self._set_job_stage(job_id, "发送图片")
             try:
                 await event.send(
                     event.chain_result([Comp.Image.fromFileSystem(str(output_path))])
@@ -539,6 +625,7 @@ class GPTImageGeneratorPlugin(Star):
             size=size,
             quality=quality,
             characters=characters,
+            source="LLM",
         )
         return self._generation_start_message()
 
@@ -547,12 +634,24 @@ class GPTImageGeneratorPlugin(Star):
         """直接测试 GPT Image 2 生图；正常聊天也可由 LLM 自动调用。"""
 
         event.stop_event()
-        started_at = time.monotonic()
-        yield event.plain_result(self._generation_start_message())
-        message = await self._generate_image(
-            event, str(prompt or ""), started_at=started_at
+        raw_prompt = str(prompt or "").strip()
+        if not self._is_allowed(event):
+            yield event.plain_result(
+                "生图功能未启用，或当前用户/群没有使用权限。"
+            )
+            return
+        if not raw_prompt:
+            yield event.plain_result("请提供需要生成的画面描述。")
+            return
+        self._start_background_generation(
+            event,
+            raw_prompt,
+            size=None,
+            quality=None,
+            characters=None,
+            source="/生图",
         )
-        yield event.plain_result(message)
+        yield event.plain_result(self._generation_start_message())
 
     @filter.command("生图人物", alias={"生图角色"})
     async def character_list_command(self, event: AstrMessageEvent):
@@ -574,25 +673,93 @@ class GPTImageGeneratorPlugin(Star):
 
     @filter.command("生图状态", alias={"生图配额"})
     async def status_command(self, event: AstrMessageEvent):
-        """查看当前用户、群聊配额以及基础配置状态。"""
+        """查看任务池、当前用户与群聊配额以及基础配置状态。"""
 
         event.stop_event()
         user_id, group_id = self._identity(event)
         status = await self.rate_limiter.status(user_id, group_id)
+        pool = self._active_job_snapshot(user_id, group_id)
         limits = self.rate_limiter.limits
-        api_key_configured = bool(str(self._get("api", "api_key", default="") or "").strip())
+        api_key_configured = bool(
+            str(self._get("api", "api_key", default="") or "").strip()
+        )
+        review_key_configured = bool(
+            str(self._get("safety", "review_api_key", default="") or "").strip()
+        )
+        review_model = str(
+            self._get("safety", "review_model", default="") or "未配置"
+        )
+        fail_mode = "故障即拒绝" if self.moderator.fail_closed else "故障时放行"
+        safety_text = (
+            f"独立 LLM 审核（{fail_mode}）"
+            if self.moderator.enabled
+            else "仅本地硬规则"
+        )
         lines = [
-            f"模型：{self._get('api', 'model', default='gpt-image-2')}",
-            f"UUAPI Key：{'已配置' if api_key_configured else '未配置'}",
-            f"安全审核：{'开启' if self.moderator.enabled else '仅本地基础检查'}（失败关闭：{self.moderator.fail_closed}）",  # noqa: E501
-            f"人物参考：{len(self.references.characters)} 个",
-            f"你的调用：{status['user_attempts']}/{limits.user_max_attempts}（{limits.user_attempt_window_seconds} 秒窗口）",  # noqa: E501
-            f"你的成功生图：{status['user_generations']}/{limits.user_max_generations}（{limits.user_generation_window_seconds} 秒窗口）",  # noqa: E501
+            "🎨 生图服务状态",
+            "",
+            "【服务配置】",
+            f"• 生图模型：{self._get('api', 'model', default='gpt-image-2')}",
+            f"• 生图接口：{self._get('api', 'base_url', default='https://uuapi.cc/v1')}",
+            f"• 生图密钥：{'已配置' if api_key_configured else '未配置'}",
+            f"• 安全审核：{safety_text}",
+            f"• 审核模型：{review_model}",
+            f"• 审核密钥：{'已配置' if review_key_configured else '未配置'}",
+            f"• 人物参考：{len(self.references.characters)} 个",
+            "",
+            "【任务池 / 队列】",
+            f"• 全局任务：{pool['global']} 个",
+            f"• 并发槽占用：{status['global_inflight']}/{limits.global_max_concurrent}",
+            f"• 我的任务：{pool['user']} 个",
         ]
         if group_id:
             lines.append(
-                f"本群成功生图：{status['group_generations']}/{limits.group_max_generations}（{limits.group_generation_window_seconds} 秒窗口）"  # noqa: E501
+                f"• 本群任务：{pool['group']}/{limits.group_max_concurrent}"
             )
-        lines.append(f"正在生成：{status['global_inflight']}/{limits.global_max_concurrent}")
+
+        visible_jobs: list[ActiveGenerationJob] = pool["visible"]
+        if visible_jobs:
+            lines.extend(["", "【当前任务】"])
+            now = time.monotonic()
+            for job in visible_jobs[:8]:
+                owner = "我的" if job.user_id == user_id else "本群"
+                elapsed = self._format_duration(now - job.started_at)
+                lines.append(
+                    f"• #{job.job_id:04d}｜{owner}｜{job.source}｜"
+                    f"{job.stage}｜已用 {elapsed}"
+                )
+            if len(visible_jobs) > 8:
+                lines.append(f"• 另有 {len(visible_jobs) - 8} 个任务未展开")
+        else:
+            lines.append("• 当前用户/群暂无等待或处理中的任务")
+
+        user_attempts = self._format_quota(
+            status["user_attempts"], limits.user_max_attempts
+        )
+        user_generations = self._format_quota(
+            status["user_generations"], limits.user_max_generations
+        )
+        group_generations = self._format_quota(
+            status["group_generations"], limits.group_max_generations
+        )
+        lines.extend(
+            [
+                "",
+                "【我的配额】",
+                f"• 调用次数：{user_attempts}"
+                f" · {self._format_window(limits.user_attempt_window_seconds)}窗口",
+                f"• 成功生图：{user_generations}"
+                f" · {self._format_window(limits.user_generation_window_seconds)}窗口",
+            ]
+        )
+        if group_id:
+            lines.extend(
+                [
+                    "",
+                    "【本群配额】",
+                    f"• 成功生图：{group_generations}"
+                    f" · {self._format_window(limits.group_generation_window_seconds)}窗口",
+                ]
+            )
         yield event.plain_result("\n".join(lines))
 

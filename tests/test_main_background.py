@@ -64,6 +64,8 @@ def test_llm_tool_returns_before_background_generation_finishes() -> None:
         module = importlib.import_module("astrbot_plugin_img_gener.main")
         plugin = object.__new__(module.GPTImageGeneratorPlugin)
         plugin._background_tasks = set()
+        plugin._active_jobs = {}
+        plugin._next_job_id = 0
         plugin.config = {"generation": {"start_message": "自定义受理话术"}}
         plugin._is_allowed = lambda event: True
         release = asyncio.Event()
@@ -79,6 +81,15 @@ def test_llm_tool_returns_before_background_generation_finishes() -> None:
             def __init__(self):
                 self.sent = []
 
+            def get_platform_name(self):
+                return "qq"
+
+            def get_sender_id(self):
+                return "1"
+
+            def get_group_id(self):
+                return "100"
+
             def plain_result(self, message):
                 return message
 
@@ -92,25 +103,33 @@ def test_llm_tool_returns_before_background_generation_finishes() -> None:
         assert len(plugin._background_tasks) == 1
         task = next(iter(plugin._background_tasks))
         assert not task.done()
+        assert len(plugin._active_jobs) == 1
 
         release.set()
         await task
         assert event.sent == ["后台完成"]
+        assert plugin._active_jobs == {}
 
     asyncio.run(scenario())
 
 
-def test_draw_command_yields_progress_before_starting_generation() -> None:
+def test_draw_command_yields_progress_and_continues_in_background() -> None:
     async def scenario() -> None:
         _install_astrbot_stubs()
         sys.modules.pop("astrbot_plugin_img_gener.main", None)
         module = importlib.import_module("astrbot_plugin_img_gener.main")
         plugin = object.__new__(module.GPTImageGeneratorPlugin)
+        plugin._background_tasks = set()
+        plugin._active_jobs = {}
+        plugin._next_job_id = 0
+        plugin._is_allowed = lambda event: True
         calls = []
+        release = asyncio.Event()
         plugin.config = {"generation": {"start_message": "自定义开始反馈"}}
 
         async def fake_generate(event, prompt, **kwargs):
             del event, kwargs
+            await release.wait()
             calls.append(prompt)
             return "生成完成"
 
@@ -119,12 +138,25 @@ def test_draw_command_yields_progress_before_starting_generation() -> None:
         class Event:
             def __init__(self):
                 self.stopped = False
+                self.sent = []
+
+            def get_platform_name(self):
+                return "qq"
+
+            def get_sender_id(self):
+                return "2"
+
+            def get_group_id(self):
+                return "100"
 
             def stop_event(self):
                 self.stopped = True
 
             def plain_result(self, message):
                 return message
+
+            async def send(self, message):
+                self.sent.append(message)
 
         event = Event()
         results = plugin.draw_command(event, "test prompt")
@@ -133,12 +165,17 @@ def test_draw_command_yields_progress_before_starting_generation() -> None:
         assert event.stopped
         assert progress == "自定义开始反馈"
         assert calls == []
-
-        completed = await anext(results)
-        assert completed == "生成完成"
-        assert calls == ["test prompt"]
+        assert len(plugin._active_jobs) == 1
         with pytest.raises(StopAsyncIteration):
             await anext(results)
+
+        task = next(iter(plugin._background_tasks))
+        assert not task.done()
+        release.set()
+        await task
+        assert calls == ["test prompt"]
+        assert event.sent == ["生成完成"]
+        assert plugin._active_jobs == {}
 
     asyncio.run(scenario())
 
@@ -184,3 +221,84 @@ def test_duration_format_is_human_readable() -> None:
     assert module.GPTImageGeneratorPlugin._format_duration(72.34) == (
         "1 分 12.3 秒"
     )
+
+
+def test_status_command_lists_active_jobs_with_elapsed_time() -> None:
+    async def scenario() -> None:
+        _install_astrbot_stubs()
+        sys.modules.pop("astrbot_plugin_img_gener.main", None)
+        module = importlib.import_module("astrbot_plugin_img_gener.main")
+        plugin = object.__new__(module.GPTImageGeneratorPlugin)
+        plugin._active_jobs = {}
+        plugin._next_job_id = 0
+        plugin.config = {
+            "api": {
+                "base_url": "https://uuapi.cc/v1",
+                "api_key": "image-key",
+                "model": "gpt-image-2",
+            },
+            "safety": {
+                "review_api_key": "review-key",
+                "review_model": "review-model",
+            },
+        }
+        plugin.moderator = types.SimpleNamespace(enabled=True, fail_closed=True)
+        plugin.references = types.SimpleNamespace(characters=[])
+
+        limits = types.SimpleNamespace(
+            user_max_attempts=3,
+            user_attempt_window_seconds=600,
+            user_max_generations=5,
+            user_generation_window_seconds=3600,
+            group_max_generations=20,
+            group_generation_window_seconds=3600,
+            global_max_concurrent=2,
+            group_max_concurrent=1,
+        )
+
+        class Limiter:
+            def __init__(self):
+                self.limits = limits
+
+            async def status(self, user_id, group_id):
+                del user_id, group_id
+                return {
+                    "user_attempts": 1,
+                    "user_generations": 1,
+                    "group_generations": 2,
+                    "global_inflight": 1,
+                }
+
+        plugin.rate_limiter = Limiter()
+
+        class Event:
+            def stop_event(self):
+                pass
+
+            def get_platform_name(self):
+                return "qq"
+
+            def get_sender_id(self):
+                return "1"
+
+            def get_group_id(self):
+                return "100"
+
+            def plain_result(self, message):
+                return message
+
+        event = Event()
+        job_id, _ = plugin._register_job(event, source="LLM")
+        plugin._active_jobs[job_id].started_at -= 65
+        plugin._set_job_stage(job_id, "生成图片")
+
+        results = plugin.status_command(event)
+        message = await anext(results)
+
+        assert "【任务池 / 队列】" in message
+        assert "全局任务：1 个" in message
+        assert "生成图片" in message
+        assert "已用 1 分" in message
+        assert "【我的配额】" in message
+
+    asyncio.run(scenario())
