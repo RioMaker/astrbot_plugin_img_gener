@@ -142,15 +142,30 @@ class OpenAICompatibleImageClient:
         data = await self._post_json("/images/generations", payload)
         return await self._parse_image_response(data)
 
+    @staticmethod
+    def source_from_paths(paths: tuple[Path, ...]) -> list[tuple[str, bytes, str]]:
+        sources: list[tuple[str, bytes, str]] = []
+        for index, path in enumerate(paths, start=1):
+            media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+            suffix = Path(path.name).suffix.lower()
+            if suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
+                suffix = ".png"
+            # Numbered filenames keep upload order aligned with the prompt's
+            # "第 N 张参考图" designation, which some gateways pass through.
+            sources.append((f"reference_{index}{suffix}", path.read_bytes(), media_type))
+        return sources
+
     async def edit(
         self,
         prompt: str,
-        image_paths: tuple[Path, ...],
+        sources: list[tuple[str, bytes, str]],
         *,
         size: str,
         quality: str,
     ) -> ImageResponse:
-        if not image_paths:
+        """Edit with in-memory image sources: (filename, content, media_type)."""
+
+        if not sources:
             return await self.generate(prompt, size=size, quality=quality)
         form_data: dict[str, str] = {
             "model": self.model,
@@ -160,10 +175,9 @@ class OpenAICompatibleImageClient:
         }
         if quality:
             form_data["quality"] = quality
-        files: list[tuple[str, tuple[str, bytes, str]]] = []
-        for path in image_paths:
-            media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-            files.append((self.edit_image_field, (path.name, path.read_bytes(), media_type)))
+        files: list[tuple[str, tuple[str, bytes, str]]] = [
+            (self.edit_image_field, source) for source in sources
+        ]
         started = time.monotonic()
         try:
             async with httpx.AsyncClient(

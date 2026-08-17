@@ -2,6 +2,12 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
+.pytest_tmp/
+pytest-cache-files-*
+.vendor_httpx/
+.piptmp/
+.sandboxtest/
+.research_astrbot/
 .research/
 .venv/
 dist/

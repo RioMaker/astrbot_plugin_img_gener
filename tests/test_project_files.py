@@ -21,6 +21,20 @@ def test_configuration_schema_is_valid_json() -> None:
     assert "start_message" in schema["generation"]["items"]
 
 
+def test_character_templates_have_isolated_slots() -> None:
+    schema = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
+    templates = schema["references"]["items"]["characters"]["templates"]
+    slot_keys = [key for key in templates if key != "character"]
+    assert len(slot_keys) >= 12
+    # Each slot keeps its own upload folder in AstrBot (folder derived from the
+    # template key), so every character manages its images independently.
+    for key in slot_keys:
+        assert templates[key]["items"]["reference_images"]["type"] == "file"
+        assert templates[key]["items"]["name"]["type"] == "string"
+    # Legacy shared template stays for existing installs.
+    assert templates["character"]["items"]["reference_images"]["type"] == "file"
+
+
 def test_metadata_and_requirements_exist() -> None:
     metadata = (ROOT / "metadata.yaml").read_text(encoding="utf-8")
     requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8")

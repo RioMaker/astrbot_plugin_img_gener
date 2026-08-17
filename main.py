@@ -25,6 +25,7 @@ try:
         normalize_base_url,
         resolve_secret,
     )
+    from .contact_sheet import build_contact_sheet
     from .errors import ConfigurationError, ImageGeneratorError
     from .image_client import OpenAICompatibleImageClient
     from .moderation import PromptModerator
@@ -41,6 +42,7 @@ except ImportError:  # pragma: no cover - direct script-style import fallback.
         normalize_base_url,
         resolve_secret,
     )
+    from contact_sheet import build_contact_sheet
     from errors import ConfigurationError, ImageGeneratorError
     from image_client import OpenAICompatibleImageClient
     from moderation import PromptModerator
@@ -134,6 +136,9 @@ class GPTImageGeneratorPlugin(Star):
             ),
             max_image_size_mb=self._int(
                 "references", "max_image_size_mb", default=12, minimum=1
+            ),
+            per_character_limit=self._int(
+                "references", "multi_character_image_limit", default=1, minimum=1
             ),
         )
         self.moderator = PromptModerator(
@@ -668,12 +673,47 @@ class GPTImageGeneratorPlugin(Star):
             "references", "strict_references", default=True
         ):
             return "人物参考图缺失或不可用：" + "、".join(resolved.missing_characters)
+        if resolved.capped_characters and self._bool(
+            "references", "strict_references", default=True
+        ):
+            return (
+                "同时指定的人物超过了单次参考图上限，以下人物未能携带参考图："
+                + "、".join(resolved.capped_characters)
+                + "。请减少同框人物数量，或在插件设置中调大「单次最多携带参考图」。"
+            )
+
+        reference_mode = str(
+            self._get("references", "reference_mode", default="auto") or "auto"
+        ).strip().lower()
+        use_sheet = (reference_mode == "sheet" or (
+            reference_mode == "auto" and len(resolved.characters) > 1
+        )) and len(resolved.image_paths) > 1
+        sheet = None
+        if use_sheet:
+            try:
+                sheet = build_contact_sheet(resolved.image_paths)
+            except ImageGeneratorError:
+                logger.warning(
+                    "[img_gener] contact sheet build failed, "
+                    "falling back to separate reference uploads"
+                )
+                use_sheet = False
+        sources = (
+            [("contact_sheet.png", sheet.content, sheet.media_type)]
+            if use_sheet and sheet is not None
+            else OpenAICompatibleImageClient.source_from_paths(resolved.image_paths)
+        )
+        logger.info(
+            "[img_gener] reference upload mode=%s files=%s",
+            "sheet" if use_sheet else "multi",
+            ",".join(name for name, _, _ in sources) or "none",
+        )
 
         prompt_prefix = str(
             self._get("generation", "prompt_prefix", default="") or ""
         ).strip()
         effective_prompt = CharacterReferenceManager.augment_prompt(
-            raw_prompt, resolved
+            raw_prompt, resolved, use_sheet=use_sheet
         )
         if prompt_prefix:
             effective_prompt = f"{prompt_prefix}\n{effective_prompt}"
@@ -708,10 +748,10 @@ class GPTImageGeneratorPlugin(Star):
             self._set_job_stage(job_id, "生成图片")
 
             client = self._client()
-            if resolved.image_paths:
+            if sources:
                 generated = await client.edit(
                     effective_prompt,
-                    resolved.image_paths,
+                    sources,
                     size=selected_size,
                     quality=selected_quality,
                 )
