@@ -88,6 +88,18 @@
         "type": "text",
         "default": "",
         "hint": "会加入每次实际提交的提示词，也会一并经过安全审核。"
+      },
+      "expected_minutes": {
+        "description": "预计生图耗时（分钟）",
+        "type": "int",
+        "default": 3,
+        "hint": "开始生图时告知用户的预计等待时间，仅作提示，不影响实际生成。"
+      },
+      "enable_evaluation": {
+        "description": "生成后发送简短评价",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，生成完成会调用「安全审核 → 识图模型」对图片给出简短评价；识图失败则仅用提示词评价。关闭则不发送评价。"
       }
     }
   },
@@ -126,6 +138,12 @@
         "type": "string",
         "default": "",
         "hint": "填写审核站已开通的聊天模型 ID；启用 LLM 审核时不能为空。"
+      },
+      "vision_model": {
+        "description": "识图模型（视觉）",
+        "type": "string",
+        "default": "",
+        "hint": "用于生成后评价图片的多模态模型 ID，复用审核站 Base URL 与 Key；留空则跳过评价。"
       },
       "review_timeout_seconds": {
         "description": "审核超时（秒）",

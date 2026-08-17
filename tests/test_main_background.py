@@ -99,7 +99,10 @@ def test_llm_tool_returns_before_background_generation_finishes() -> None:
 
         event = Event()
         result = await plugin.generate_image(event, "test prompt")
-        assert result == "自定义受理话术\n本次尺寸：816x816"
+        assert result.startswith("自定义受理话术\n本次尺寸：816x816")
+        assert "当前队列：全局 1 个" in result
+        assert "预计生成约 3 分钟" in result
+        assert "完成后会单独发送图片和简短评价" in result
         await asyncio.sleep(0)
         assert len(plugin._background_tasks) == 1
         task = next(iter(plugin._background_tasks))
@@ -172,7 +175,9 @@ def test_draw_command_yields_progress_and_continues_in_background() -> None:
         progress = await anext(results)
 
         assert event.stopped
-        assert progress == "自定义开始反馈\n本次尺寸：640x1024"
+        assert progress.startswith("自定义开始反馈\n本次尺寸：640x1024")
+        assert "当前队列" in progress
+        assert "预计生成约 3 分钟" in progress
         assert calls == []
         assert len(plugin._active_jobs) == 1
         with pytest.raises(StopAsyncIteration):

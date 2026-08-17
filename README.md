@@ -30,6 +30,7 @@
 安全审核 → 审核 API Base URL = https://uuapi.shop/v1
 安全审核 → 审核 API Key = sk-你的审核密钥
 安全审核 → UUAPI 审核模型 = 你在审核站已开通的聊天模型 ID
+安全审核 → 识图模型（视觉）= 审核站已开通的多模态模型 ID（可选，用于生成后评价图片）
 ```
 
 两个 API Key 都可写成 `$环境变量名`。例如生图填写 `$UUAPI_IMAGE_API_KEY`、审核
@@ -127,10 +128,19 @@ AstrBot/data/plugin_data/astrbot_plugin_img_gener/rate_limits.sqlite3
 generate_image(prompt=..., size="1024x1536", quality="medium")
 ```
 
-`generate_image` 会立即向 LLM 返回设置中的“开始生图提示语”，随后在后台完成安全审核、
-UUAPI 生图、图片下载和发送。这样不会让耗时的生图请求占满 AstrBot 的工具调用
-时限。AstrBot 的 `provider_settings.tool_call_timeout` 默认通常为 60 秒，而一次
-审核加参考图生成可能超过这个时间；插件的后台模式不依赖调大该值。
+`generate_image` 会立即向 LLM 返回“开始生图提示语 + 当前队列概况 + 预计耗时”，
+随后在后台完成安全审核、UUAPI 生图、图片下载和发送。这样不会让耗时的生图请求
+占满 AstrBot 的工具调用时限。AstrBot 的 `provider_settings.tool_call_timeout`
+默认通常为 60 秒，而一次审核加参考图生成通常需要约 3 分钟；插件的后台模式不
+依赖调大该值。工具描述已明确告诉 LLM“这只是受理、图片尚未生成”，避免它把受理
+误报成已完成。
+
+生成完成后，插件会：
+
+1. 发送一条 `@发起人 + 尺寸/质量/总用时 + 用户提示词 + 图片` 的消息；
+2. 再调用“安全审核 → 识图模型”对图片给出 1~3 句简短评价并 `@发起人` 发送；
+   识图失败时退回为“仅根据提示词”评价。可在“生成参数 → 生成后发送简短评价”
+   关闭该评价。
 
 插件也提供几个测试命令：
 

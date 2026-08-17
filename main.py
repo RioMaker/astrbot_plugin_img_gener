@@ -224,6 +224,40 @@ class GPTImageGeneratorPlugin(Star):
     def _format_quota(used: int, maximum: int) -> str:
         return f"{used}/不限" if maximum <= 0 else f"{used}/{maximum}"
 
+    @staticmethod
+    def _mention(event: AstrMessageEvent) -> Any:
+        sender_id = str(event.get_sender_id() or "").strip()
+        if not sender_id:
+            return None
+        at_cls = getattr(Comp, "At", None)
+        if at_cls is not None:
+            try:
+                return at_cls(qq=sender_id)
+            except Exception:
+                pass
+        return Comp.Plain(f"@{sender_id} ")
+
+    def _mention_chain(self, event: AstrMessageEvent, text: str) -> Any:
+        parts: list[Any] = []
+        mention = self._mention(event)
+        if mention is not None:
+            parts.append(mention)
+        if text:
+            parts.append(Comp.Plain(text))
+        return event.chain_result(parts)
+
+    def _completion_chain(
+        self, event: AstrMessageEvent, text: str, image_path: Path
+    ) -> Any:
+        parts: list[Any] = []
+        mention = self._mention(event)
+        if mention is not None:
+            parts.append(mention)
+        if text:
+            parts.append(Comp.Plain(text))
+        parts.append(Comp.Image.fromFileSystem(str(image_path)))
+        return event.chain_result(parts)
+
     def _register_job(
         self, event: AstrMessageEvent, *, source: str, size: str
     ) -> tuple[int, float]:
@@ -476,7 +510,8 @@ class GPTImageGeneratorPlugin(Star):
                 started_at=started_at,
                 job_id=job_id,
             )
-            await event.send(event.plain_result(message))
+            if message:
+                await event.send(event.plain_result(message))
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -503,7 +538,7 @@ class GPTImageGeneratorPlugin(Star):
         quality: str | None,
         characters: list[str] | None,
         source: str,
-    ) -> None:
+    ) -> int:
         job_id, started_at = self._register_job(event, source=source, size=size)
         try:
             task = asyncio.create_task(
@@ -523,6 +558,81 @@ class GPTImageGeneratorPlugin(Star):
             raise
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
+        return job_id
+
+    async def _start_notice(self, event: AstrMessageEvent, size: str) -> str:
+        user_id, group_id = self._identity(event)
+        pool = self._active_job_snapshot(user_id, group_id)
+        try:
+            status = await self.rate_limiter.status(user_id, group_id)
+            inflight = int(status.get("global_inflight", 0))
+            global_max = int(self.rate_limiter.limits.global_max_concurrent)
+            concurrency = f"全局并发：{inflight}/{global_max}"
+        except Exception:
+            concurrency = "全局并发：暂不可用"
+        expected = self._int("generation", "expected_minutes", default=3, minimum=1)
+        queue_line = f"当前队列：全局 {pool['global']} 个、你的 {pool['user']} 个"
+        if group_id:
+            queue_line += f"、本群 {pool['group']} 个"
+        lines = [
+            self._generation_start_message(size),
+            queue_line,
+            concurrency,
+            (
+                f"预计生成约 {expected} 分钟，完成后会单独发送图片和简短评价；"
+                "可用 /生图状态 查看进度与已用时间。"
+            ),
+        ]
+        return "\n".join(lines)
+
+    async def _evaluate_image(
+        self,
+        prompt: str,
+        image_content: bytes,
+        media_type: str,
+    ) -> str | None:
+        if not self._bool("generation", "enable_evaluation", default=True):
+            return None
+        vision_model = str(self._get("safety", "vision_model", default="") or "").strip()
+        if not vision_model:
+            logger.info("[img_gener] vision model not configured, skipping evaluation")
+            return None
+        timeout = self._float("safety", "review_timeout_seconds", default=45, minimum=5)
+        client = self._review_client()
+        vision_prompt = (
+            "请用 1~3 句话简短评价下面这张 AI 生成的图片："
+            "描述画面内容与风格，并判断是否贴合用户需求，语气自然、口语化。\n"
+            f"用户原始需求：{prompt}"
+        )
+        try:
+            text = await client.chat_completion_vision(
+                vision_model,
+                vision_prompt,
+                image_content,
+                media_type,
+                timeout_seconds=timeout,
+            )
+            return text.strip()[:500] or None
+        except ImageGeneratorError as exc:
+            logger.warning(
+                "[img_gener] vision evaluation failed, falling back to prompt-only: %s",
+                exc.detail[:400],
+            )
+        fallback_prompt = (
+            "（识图失败，无法读取图片）请仅根据下面的生成提示词，"
+            "用 1~3 句话简短评价这张预期生成的画面，语气自然。\n"
+            f"提示词：{prompt}"
+        )
+        try:
+            text = await client.chat_completion(
+                vision_model, fallback_prompt, timeout_seconds=timeout
+            )
+            return text.strip()[:500] or None
+        except ImageGeneratorError as exc:
+            logger.warning(
+                "[img_gener] prompt-only evaluation failed: %s", exc.detail[:400]
+            )
+            return None
 
     async def _generate_image(
         self,
@@ -534,7 +644,7 @@ class GPTImageGeneratorPlugin(Star):
         characters: list[str] | None = None,
         started_at: float | None = None,
         job_id: int | None = None,
-    ) -> str:
+    ) -> str | None:
         started_at = time.monotonic() if started_at is None else started_at
         self._set_job_stage(job_id, "检查权限与配额")
         if not self._is_allowed(event):
@@ -616,10 +726,18 @@ class GPTImageGeneratorPlugin(Star):
             lease_active = False
             output_path = self.output_store.save(generated)
             self._set_job_stage(job_id, "发送图片")
+            reference_text = (
+                "；已携带人物参考：" + "、".join(resolved.names)
+                if resolved.names
+                else ""
+            )
+            duration = self._format_duration(time.monotonic() - started_at)
+            caption = (
+                f" 图片已生成（{selected_size}，{selected_quality}）"
+                f"{reference_text}。总用时：{duration}。\n提示词：{raw_prompt}"
+            )
             try:
-                await event.send(
-                    event.chain_result([Comp.Image.fromFileSystem(str(output_path))])
-                )
+                await event.send(self._completion_chain(event, caption, output_path))
             except Exception as exc:
                 logger.warning(
                     "[img_gener] generated but failed to send image path=%s error=%s",
@@ -627,16 +745,18 @@ class GPTImageGeneratorPlugin(Star):
                     str(exc)[:500],
                 )
                 return "图片已经生成并计入配额，但聊天平台发送失败，请联系管理员查看日志。"
-            reference_text = (
-                "；已携带人物参考：" + "、".join(resolved.names)
-                if resolved.names
-                else ""
+            self._set_job_stage(job_id, "生成评价")
+            evaluation = await self._evaluate_image(
+                raw_prompt, generated.content, generated.media_type
             )
-            duration = self._format_duration(time.monotonic() - started_at)
-            return (
-                f"图片已通过审核并发送（{selected_size}，{selected_quality}）"
-                f"{reference_text}。总用时：{duration}。"
-            )
+            if evaluation:
+                try:
+                    await event.send(self._mention_chain(event, f" {evaluation}"))
+                except Exception as exc:
+                    logger.warning(
+                        "[img_gener] failed to send evaluation: %s", str(exc)[:500]
+                    )
+            return None
         except ImageGeneratorError as exc:
             logger.warning("[img_gener] generation failed: %s", exc.detail[:800])
             return exc.public_message
@@ -656,12 +776,18 @@ class GPTImageGeneratorPlugin(Star):
         quality: str | None = None,
         characters: list[str] | None = None,
     ) -> str:
-        """Generate and send one policy-compliant image with GPT Image 2.
+        """Submit one image generation request to GPT Image 2 and return immediately.
 
         Use this tool only when the user clearly asks to create an image. Keep the
         user's visual intent in prompt. The plugin performs safety review and rate
         limiting. Configured character names such as 可可子 or 菌菌 are detected
         automatically and their stored reference images are attached.
+
+        IMPORTANT: generation runs in the BACKGROUND and typically takes about 3
+        minutes. When this tool returns, the image is NOT ready yet — the request
+        has only been accepted. Tell the user it is generating and ask them to
+        wait; do NOT claim the image is finished. The plugin will later send the
+        image, the prompt, and a short evaluation as separate messages.
 
         Args:
             prompt(string): Complete visual description for the requested image.
@@ -688,7 +814,7 @@ class GPTImageGeneratorPlugin(Star):
             characters=characters,
             source="LLM",
         )
-        return self._generation_start_message(selected_size)
+        return await self._start_notice(event, selected_size)
 
     @filter.command("生图", alias={"绘图", "draw"})
     async def draw_command(self, event: AstrMessageEvent, prompt: GreedyStr):
@@ -721,7 +847,7 @@ class GPTImageGeneratorPlugin(Star):
             characters=None,
             source="/生图",
         )
-        yield event.plain_result(self._generation_start_message(selected_size))
+        yield event.plain_result(await self._start_notice(event, selected_size))
 
     @filter.command("生图人物", alias={"生图角色"})
     async def character_list_command(self, event: AstrMessageEvent):

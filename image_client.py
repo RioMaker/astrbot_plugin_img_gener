@@ -215,10 +215,48 @@ class OpenAICompatibleImageClient:
             timeout=timeout_seconds,
             operation="安全审核服务",
         )
+        return self._parse_chat_content(data)
+
+    async def chat_completion_vision(
+        self,
+        model: str,
+        prompt: str,
+        image_bytes: bytes,
+        media_type: str,
+        *,
+        timeout_seconds: float = 60,
+    ) -> str:
+        data_url = (
+            f"data:{media_type};base64,{base64.b64encode(image_bytes).decode('ascii')}"
+        )
+        payload = {
+            "model": model,
+            "stream": False,
+            "temperature": 0,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ],
+                }
+            ],
+        }
+        data = await self._post_json(
+            "/chat/completions",
+            payload,
+            timeout=timeout_seconds,
+            operation="识图评价服务",
+        )
+        return self._parse_chat_content(data)
+
+    @staticmethod
+    def _parse_chat_content(data: dict[str, object]) -> str:
         try:
             content = data["choices"][0]["message"]["content"]  # type: ignore[index]
         except (KeyError, IndexError, TypeError) as exc:
-            raise ImageAPIError("审核模型返回格式不正确。") from exc
+            raise ImageAPIError("模型返回格式不正确。") from exc
         if isinstance(content, list):
             content = "".join(
                 str(item.get("text", "")) for item in content if isinstance(item, dict)
