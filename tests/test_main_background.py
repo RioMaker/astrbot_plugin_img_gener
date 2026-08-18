@@ -117,6 +117,70 @@ def test_llm_tool_returns_before_background_generation_finishes() -> None:
     asyncio.run(scenario())
 
 
+def test_llm_tool_preserves_original_chinese_prompt_and_reference_text() -> None:
+    async def scenario() -> None:
+        _install_astrbot_stubs()
+        sys.modules.pop("astrbot_plugin_img_gener.main", None)
+        module = importlib.import_module("astrbot_plugin_img_gener.main")
+        plugin = object.__new__(module.GPTImageGeneratorPlugin)
+        plugin._background_tasks = set()
+        plugin._active_jobs = {}
+        plugin._next_job_id = 0
+        plugin.config = {}
+        plugin._is_allowed = lambda event: True
+        plugin.moderator = module.PromptModerator(enabled=False)
+        plugin.rate_limiter = types.SimpleNamespace(
+            limits=types.SimpleNamespace(global_max_concurrent=2),
+            status=lambda user_id, group_id: _status(user_id, group_id),
+        )
+        received = {}
+        release = asyncio.Event()
+
+        async def _status(user_id, group_id):
+            del user_id, group_id
+            return {"global_inflight": 1}
+
+        async def fake_generate(event, prompt, **kwargs):
+            del event
+            received["prompt"] = prompt
+            received.update(kwargs)
+            await release.wait()
+            return None
+
+        plugin._generate_image = fake_generate
+
+        class Event:
+            def get_platform_name(self):
+                return "qq"
+
+            def get_sender_id(self):
+                return "1"
+
+            def get_group_id(self):
+                return None
+
+            def get_message_str(self):
+                return "\u8bf7\u753b\u53ef\u53ef\u5b50\u5728\u96e8\u540e\u7684\u8f66\u7ad9\u6491\u900f\u660e\u4f1e"
+
+        event = Event()
+        result = await plugin.generate_image(
+            event,
+            "Coco at a rainy train station holding a transparent umbrella",
+        )
+        await asyncio.sleep(0)
+
+        assert "\u53ef\u53ef\u5b50" in received["prompt"]
+        assert received["reference_prompt"] == (
+            "\u8bf7\u753b\u53ef\u53ef\u5b50\u5728\u96e8\u540e\u7684\u8f66\u7ad9\u6491\u900f\u660e\u4f1e"
+        )
+        assert "Coco" not in received["prompt"]
+
+        release.set()
+        await next(iter(plugin._background_tasks))
+
+    asyncio.run(scenario())
+
+
 def test_draw_command_yields_progress_and_continues_in_background() -> None:
     async def scenario() -> None:
         _install_astrbot_stubs()

@@ -359,6 +359,37 @@ class GPTImageGeneratorPlugin(Star):
         group_id = f"{platform}:{raw_group}" if raw_group else None
         return user_id, group_id
 
+    @staticmethod
+    def _event_message_text(event: AstrMessageEvent) -> str:
+        """Read the user's original text instead of the LLM-rewritten tool args."""
+
+        getter = getattr(event, "get_message_str", None)
+        if callable(getter):
+            try:
+                return str(getter() or "").strip()
+            except Exception:
+                pass
+        return str(getattr(event, "message_str", "") or "").strip()
+
+    @staticmethod
+    def _contains_cjk(text: str) -> bool:
+        return any("\u4e00" <= char <= "\u9fff" for char in text)
+
+    def _effective_tool_prompt(
+        self, prompt: str, original_message: str
+    ) -> tuple[str, str]:
+        """Keep Chinese user intent when the tool model translated it to English."""
+
+        tool_prompt = str(prompt or "").strip()
+        original = str(original_message or "").strip()
+        if (
+            original
+            and self._contains_cjk(original)
+            and not self._contains_cjk(tool_prompt)
+        ):
+            return original, original
+        return tool_prompt, "\n".join(item for item in (original, tool_prompt) if item)
+
     def _is_allowed(self, event: AstrMessageEvent) -> bool:
         if not self._bool("access", "enabled", default=True):
             return False
@@ -497,6 +528,7 @@ class GPTImageGeneratorPlugin(Star):
         size: str,
         quality: str | None,
         characters: list[str] | None,
+        reference_prompt: str = "",
         job_id: int,
         started_at: float,
     ) -> None:
@@ -507,6 +539,7 @@ class GPTImageGeneratorPlugin(Star):
                 size=size,
                 quality=quality,
                 characters=characters,
+                reference_prompt=reference_prompt,
                 started_at=started_at,
                 job_id=job_id,
             )
@@ -537,6 +570,7 @@ class GPTImageGeneratorPlugin(Star):
         size: str,
         quality: str | None,
         characters: list[str] | None,
+        reference_prompt: str = "",
         source: str,
     ) -> int:
         job_id, started_at = self._register_job(event, source=source, size=size)
@@ -548,6 +582,7 @@ class GPTImageGeneratorPlugin(Star):
                     size=size,
                     quality=quality,
                     characters=characters,
+                    reference_prompt=reference_prompt,
                     job_id=job_id,
                     started_at=started_at,
                 ),
@@ -642,6 +677,7 @@ class GPTImageGeneratorPlugin(Star):
         size: str | None = None,
         quality: str | None = None,
         characters: list[str] | None = None,
+        reference_prompt: str = "",
         started_at: float | None = None,
         job_id: int | None = None,
     ) -> str | None:
@@ -659,7 +695,10 @@ class GPTImageGeneratorPlugin(Star):
         except ImageGeneratorError as exc:
             return exc.public_message
 
-        resolved = self.references.resolve(raw_prompt, characters)
+        resolved = self.references.resolve(
+            "\n".join(item for item in (reference_prompt, raw_prompt) if item),
+            characters,
+        )
         if resolved.unknown_requested_names and self._bool(
             "references", "strict_references", default=True
         ):
@@ -797,21 +836,26 @@ class GPTImageGeneratorPlugin(Star):
         """  # noqa: E501
         if not self._is_allowed(event):
             return "生图功能未启用，或当前用户/群没有使用权限。"
-        if not str(prompt or "").strip():
+        original_message = self._event_message_text(event)
+        effective_prompt, reference_prompt = self._effective_tool_prompt(
+            prompt, original_message
+        )
+        if not effective_prompt:
             return "请提供需要生成的画面描述。"
         try:
             selected_size = self._normalize_size(size)
         except ImageGeneratorError as exc:
             return exc.public_message
-        local_rejection = await self._preflight_local_review(event, str(prompt).strip())
+        local_rejection = await self._preflight_local_review(event, effective_prompt)
         if local_rejection:
             return local_rejection
         self._start_background_generation(
             event,
-            prompt,
+            effective_prompt,
             size=selected_size,
             quality=quality,
             characters=characters,
+            reference_prompt=reference_prompt,
             source="LLM",
         )
         return await self._start_notice(event, selected_size)
