@@ -32,8 +32,14 @@
         "description": "参考图上传字段",
         "type": "string",
         "default": "image",
-        "options": ["image", "image[]"],
-        "labels": ["image（UUAPI 默认）", "image[]（官方兼容）"],
+        "options": [
+          "image",
+          "image[]"
+        ],
+        "labels": [
+          "image（UUAPI 默认）",
+          "image[]（官方兼容）"
+        ],
         "hint": "UUAPI 文档使用 image；若后续网关要求官方数组字段，可切换为 image[]。"
       },
       "user_agent": {
@@ -59,22 +65,53 @@
         "description": "默认生图尺寸",
         "type": "string",
         "default": "816x816",
-        "options": ["auto", "816x816", "640x1024", "1024x640", "1024x1024", "1024x1536", "1536x1024"],
-        "labels": ["自动", "小方图 816×816（较快）", "小竖图 640×1024", "小横图 1024×640", "方图 1024×1024", "竖图 1024×1536", "横图 1536×1024"],
+        "options": [
+          "auto",
+          "816x816",
+          "640x1024",
+          "1024x640",
+          "1024x1024",
+          "1024x1536",
+          "1536x1024"
+        ],
+        "labels": [
+          "自动",
+          "小方图 816×816（较快）",
+          "小竖图 640×1024",
+          "小横图 1024×640",
+          "方图 1024×1024",
+          "竖图 1024×1536",
+          "横图 1536×1024"
+        ],
         "hint": "LLM 或 /生图 未指定尺寸时使用此值；新安装默认使用较小的 816×816。"
       },
       "allowed_sizes": {
         "description": "允许使用的尺寸",
         "type": "list",
-        "default": ["auto", "816x816", "640x1024", "1024x640", "1024x1024", "1024x1536", "1536x1024"],
-        "items": {"type": "string"},
+        "default": [
+          "auto",
+          "816x816",
+          "640x1024",
+          "1024x640",
+          "1024x1024",
+          "1024x1536",
+          "1536x1024"
+        ],
+        "items": {
+          "type": "string"
+        },
         "hint": "限制 LLM 工具可额外选择的尺寸；默认尺寸始终有效，/生图 始终使用默认尺寸。"
       },
       "default_quality": {
         "description": "默认质量",
         "type": "string",
         "default": "auto",
-        "options": ["auto", "low", "medium", "high"],
+        "options": [
+          "auto",
+          "low",
+          "medium",
+          "high"
+        ],
         "hint": "high 通常更慢且更贵。"
       },
       "start_message": {
@@ -154,7 +191,9 @@
         "description": "管理员禁用词",
         "type": "list",
         "default": [],
-        "items": {"type": "string"},
+        "items": {
+          "type": "string"
+        },
         "hint": "命中后立即拒绝且不会显示正在生图或创建后台任务，不区分大小写。不要用过短或歧义很大的词。"
       },
       "custom_policy": {
@@ -254,9 +293,9 @@
         "type": "template_list",
         "default": [],
         "templates": {
-          "character": {
-            "name": "人物参考",
-            "hint": "为一个固定人物配置名称、别名和一张或多张参考图。",
+          "c01": {
+            "name": "角色位 01",
+            "hint": "独立的角色图库：每个角色位对应一个专属图片文件夹，互不可见。新增角色时请选择一个尚未使用的角色位。",
             "display_item": "name",
             "hide_hint_in_list": true,
             "items": {
@@ -275,15 +314,574 @@
                 "description": "别名",
                 "type": "list",
                 "default": [],
-                "items": {"type": "string"},
+                "items": {
+                  "type": "string"
+                },
                 "hint": "例如：可可、Coco。过短的单字别名不会自动匹配。"
               },
               "reference_images": {
                 "description": "参考图片",
                 "type": "file",
                 "default": [],
-                "file_types": ["png", "jpg", "jpeg", "webp"],
-                "hint": "建议清晰正脸或角色设定图；可上传多张。"
+                "file_types": [
+                  "png",
+                  "jpg",
+                  "jpeg",
+                  "webp"
+                ],
+                "hint": "本角色位拥有独立的图片库，其他角色的图片不会出现在这里。建议清晰正脸或角色设定图；可上传多张。多个角色同框时默认每人只取第 1 张。"
+              },
+              "prompt_note": {
+                "description": "人物补充设定",
+                "type": "text",
+                "default": "",
+                "hint": "例如固定发色、服装或不要改变的特征。"
+              }
+            }
+          },
+          "c02": {
+            "name": "角色位 02",
+            "hint": "独立的角色图库：每个角色位对应一个专属图片文件夹，互不可见。新增角色时请选择一个尚未使用的角色位。",
+            "display_item": "name",
+            "hide_hint_in_list": true,
+            "items": {
+              "enabled": {
+                "description": "启用",
+                "type": "bool",
+                "default": true
+              },
+              "name": {
+                "description": "人物名称",
+                "type": "string",
+                "default": "",
+                "hint": "例如：可可子"
+              },
+              "aliases": {
+                "description": "别名",
+                "type": "list",
+                "default": [],
+                "items": {
+                  "type": "string"
+                },
+                "hint": "例如：可可、Coco。过短的单字别名不会自动匹配。"
+              },
+              "reference_images": {
+                "description": "参考图片",
+                "type": "file",
+                "default": [],
+                "file_types": [
+                  "png",
+                  "jpg",
+                  "jpeg",
+                  "webp"
+                ],
+                "hint": "本角色位拥有独立的图片库，其他角色的图片不会出现在这里。建议清晰正脸或角色设定图；可上传多张。多个角色同框时默认每人只取第 1 张。"
+              },
+              "prompt_note": {
+                "description": "人物补充设定",
+                "type": "text",
+                "default": "",
+                "hint": "例如固定发色、服装或不要改变的特征。"
+              }
+            }
+          },
+          "c03": {
+            "name": "角色位 03",
+            "hint": "独立的角色图库：每个角色位对应一个专属图片文件夹，互不可见。新增角色时请选择一个尚未使用的角色位。",
+            "display_item": "name",
+            "hide_hint_in_list": true,
+            "items": {
+              "enabled": {
+                "description": "启用",
+                "type": "bool",
+                "default": true
+              },
+              "name": {
+                "description": "人物名称",
+                "type": "string",
+                "default": "",
+                "hint": "例如：可可子"
+              },
+              "aliases": {
+                "description": "别名",
+                "type": "list",
+                "default": [],
+                "items": {
+                  "type": "string"
+                },
+                "hint": "例如：可可、Coco。过短的单字别名不会自动匹配。"
+              },
+              "reference_images": {
+                "description": "参考图片",
+                "type": "file",
+                "default": [],
+                "file_types": [
+                  "png",
+                  "jpg",
+                  "jpeg",
+                  "webp"
+                ],
+                "hint": "本角色位拥有独立的图片库，其他角色的图片不会出现在这里。建议清晰正脸或角色设定图；可上传多张。多个角色同框时默认每人只取第 1 张。"
+              },
+              "prompt_note": {
+                "description": "人物补充设定",
+                "type": "text",
+                "default": "",
+                "hint": "例如固定发色、服装或不要改变的特征。"
+              }
+            }
+          },
+          "c04": {
+            "name": "角色位 04",
+            "hint": "独立的角色图库：每个角色位对应一个专属图片文件夹，互不可见。新增角色时请选择一个尚未使用的角色位。",
+            "display_item": "name",
+            "hide_hint_in_list": true,
+            "items": {
+              "enabled": {
+                "description": "启用",
+                "type": "bool",
+                "default": true
+              },
+              "name": {
+                "description": "人物名称",
+                "type": "string",
+                "default": "",
+                "hint": "例如：可可子"
+              },
+              "aliases": {
+                "description": "别名",
+                "type": "list",
+                "default": [],
+                "items": {
+                  "type": "string"
+                },
+                "hint": "例如：可可、Coco。过短的单字别名不会自动匹配。"
+              },
+              "reference_images": {
+                "description": "参考图片",
+                "type": "file",
+                "default": [],
+                "file_types": [
+                  "png",
+                  "jpg",
+                  "jpeg",
+                  "webp"
+                ],
+                "hint": "本角色位拥有独立的图片库，其他角色的图片不会出现在这里。建议清晰正脸或角色设定图；可上传多张。多个角色同框时默认每人只取第 1 张。"
+              },
+              "prompt_note": {
+                "description": "人物补充设定",
+                "type": "text",
+                "default": "",
+                "hint": "例如固定发色、服装或不要改变的特征。"
+              }
+            }
+          },
+          "c05": {
+            "name": "角色位 05",
+            "hint": "独立的角色图库：每个角色位对应一个专属图片文件夹，互不可见。新增角色时请选择一个尚未使用的角色位。",
+            "display_item": "name",
+            "hide_hint_in_list": true,
+            "items": {
+              "enabled": {
+                "description": "启用",
+                "type": "bool",
+                "default": true
+              },
+              "name": {
+                "description": "人物名称",
+                "type": "string",
+                "default": "",
+                "hint": "例如：可可子"
+              },
+              "aliases": {
+                "description": "别名",
+                "type": "list",
+                "default": [],
+                "items": {
+                  "type": "string"
+                },
+                "hint": "例如：可可、Coco。过短的单字别名不会自动匹配。"
+              },
+              "reference_images": {
+                "description": "参考图片",
+                "type": "file",
+                "default": [],
+                "file_types": [
+                  "png",
+                  "jpg",
+                  "jpeg",
+                  "webp"
+                ],
+                "hint": "本角色位拥有独立的图片库，其他角色的图片不会出现在这里。建议清晰正脸或角色设定图；可上传多张。多个角色同框时默认每人只取第 1 张。"
+              },
+              "prompt_note": {
+                "description": "人物补充设定",
+                "type": "text",
+                "default": "",
+                "hint": "例如固定发色、服装或不要改变的特征。"
+              }
+            }
+          },
+          "c06": {
+            "name": "角色位 06",
+            "hint": "独立的角色图库：每个角色位对应一个专属图片文件夹，互不可见。新增角色时请选择一个尚未使用的角色位。",
+            "display_item": "name",
+            "hide_hint_in_list": true,
+            "items": {
+              "enabled": {
+                "description": "启用",
+                "type": "bool",
+                "default": true
+              },
+              "name": {
+                "description": "人物名称",
+                "type": "string",
+                "default": "",
+                "hint": "例如：可可子"
+              },
+              "aliases": {
+                "description": "别名",
+                "type": "list",
+                "default": [],
+                "items": {
+                  "type": "string"
+                },
+                "hint": "例如：可可、Coco。过短的单字别名不会自动匹配。"
+              },
+              "reference_images": {
+                "description": "参考图片",
+                "type": "file",
+                "default": [],
+                "file_types": [
+                  "png",
+                  "jpg",
+                  "jpeg",
+                  "webp"
+                ],
+                "hint": "本角色位拥有独立的图片库，其他角色的图片不会出现在这里。建议清晰正脸或角色设定图；可上传多张。多个角色同框时默认每人只取第 1 张。"
+              },
+              "prompt_note": {
+                "description": "人物补充设定",
+                "type": "text",
+                "default": "",
+                "hint": "例如固定发色、服装或不要改变的特征。"
+              }
+            }
+          },
+          "c07": {
+            "name": "角色位 07",
+            "hint": "独立的角色图库：每个角色位对应一个专属图片文件夹，互不可见。新增角色时请选择一个尚未使用的角色位。",
+            "display_item": "name",
+            "hide_hint_in_list": true,
+            "items": {
+              "enabled": {
+                "description": "启用",
+                "type": "bool",
+                "default": true
+              },
+              "name": {
+                "description": "人物名称",
+                "type": "string",
+                "default": "",
+                "hint": "例如：可可子"
+              },
+              "aliases": {
+                "description": "别名",
+                "type": "list",
+                "default": [],
+                "items": {
+                  "type": "string"
+                },
+                "hint": "例如：可可、Coco。过短的单字别名不会自动匹配。"
+              },
+              "reference_images": {
+                "description": "参考图片",
+                "type": "file",
+                "default": [],
+                "file_types": [
+                  "png",
+                  "jpg",
+                  "jpeg",
+                  "webp"
+                ],
+                "hint": "本角色位拥有独立的图片库，其他角色的图片不会出现在这里。建议清晰正脸或角色设定图；可上传多张。多个角色同框时默认每人只取第 1 张。"
+              },
+              "prompt_note": {
+                "description": "人物补充设定",
+                "type": "text",
+                "default": "",
+                "hint": "例如固定发色、服装或不要改变的特征。"
+              }
+            }
+          },
+          "c08": {
+            "name": "角色位 08",
+            "hint": "独立的角色图库：每个角色位对应一个专属图片文件夹，互不可见。新增角色时请选择一个尚未使用的角色位。",
+            "display_item": "name",
+            "hide_hint_in_list": true,
+            "items": {
+              "enabled": {
+                "description": "启用",
+                "type": "bool",
+                "default": true
+              },
+              "name": {
+                "description": "人物名称",
+                "type": "string",
+                "default": "",
+                "hint": "例如：可可子"
+              },
+              "aliases": {
+                "description": "别名",
+                "type": "list",
+                "default": [],
+                "items": {
+                  "type": "string"
+                },
+                "hint": "例如：可可、Coco。过短的单字别名不会自动匹配。"
+              },
+              "reference_images": {
+                "description": "参考图片",
+                "type": "file",
+                "default": [],
+                "file_types": [
+                  "png",
+                  "jpg",
+                  "jpeg",
+                  "webp"
+                ],
+                "hint": "本角色位拥有独立的图片库，其他角色的图片不会出现在这里。建议清晰正脸或角色设定图；可上传多张。多个角色同框时默认每人只取第 1 张。"
+              },
+              "prompt_note": {
+                "description": "人物补充设定",
+                "type": "text",
+                "default": "",
+                "hint": "例如固定发色、服装或不要改变的特征。"
+              }
+            }
+          },
+          "c09": {
+            "name": "角色位 09",
+            "hint": "独立的角色图库：每个角色位对应一个专属图片文件夹，互不可见。新增角色时请选择一个尚未使用的角色位。",
+            "display_item": "name",
+            "hide_hint_in_list": true,
+            "items": {
+              "enabled": {
+                "description": "启用",
+                "type": "bool",
+                "default": true
+              },
+              "name": {
+                "description": "人物名称",
+                "type": "string",
+                "default": "",
+                "hint": "例如：可可子"
+              },
+              "aliases": {
+                "description": "别名",
+                "type": "list",
+                "default": [],
+                "items": {
+                  "type": "string"
+                },
+                "hint": "例如：可可、Coco。过短的单字别名不会自动匹配。"
+              },
+              "reference_images": {
+                "description": "参考图片",
+                "type": "file",
+                "default": [],
+                "file_types": [
+                  "png",
+                  "jpg",
+                  "jpeg",
+                  "webp"
+                ],
+                "hint": "本角色位拥有独立的图片库，其他角色的图片不会出现在这里。建议清晰正脸或角色设定图；可上传多张。多个角色同框时默认每人只取第 1 张。"
+              },
+              "prompt_note": {
+                "description": "人物补充设定",
+                "type": "text",
+                "default": "",
+                "hint": "例如固定发色、服装或不要改变的特征。"
+              }
+            }
+          },
+          "c10": {
+            "name": "角色位 10",
+            "hint": "独立的角色图库：每个角色位对应一个专属图片文件夹，互不可见。新增角色时请选择一个尚未使用的角色位。",
+            "display_item": "name",
+            "hide_hint_in_list": true,
+            "items": {
+              "enabled": {
+                "description": "启用",
+                "type": "bool",
+                "default": true
+              },
+              "name": {
+                "description": "人物名称",
+                "type": "string",
+                "default": "",
+                "hint": "例如：可可子"
+              },
+              "aliases": {
+                "description": "别名",
+                "type": "list",
+                "default": [],
+                "items": {
+                  "type": "string"
+                },
+                "hint": "例如：可可、Coco。过短的单字别名不会自动匹配。"
+              },
+              "reference_images": {
+                "description": "参考图片",
+                "type": "file",
+                "default": [],
+                "file_types": [
+                  "png",
+                  "jpg",
+                  "jpeg",
+                  "webp"
+                ],
+                "hint": "本角色位拥有独立的图片库，其他角色的图片不会出现在这里。建议清晰正脸或角色设定图；可上传多张。多个角色同框时默认每人只取第 1 张。"
+              },
+              "prompt_note": {
+                "description": "人物补充设定",
+                "type": "text",
+                "default": "",
+                "hint": "例如固定发色、服装或不要改变的特征。"
+              }
+            }
+          },
+          "c11": {
+            "name": "角色位 11",
+            "hint": "独立的角色图库：每个角色位对应一个专属图片文件夹，互不可见。新增角色时请选择一个尚未使用的角色位。",
+            "display_item": "name",
+            "hide_hint_in_list": true,
+            "items": {
+              "enabled": {
+                "description": "启用",
+                "type": "bool",
+                "default": true
+              },
+              "name": {
+                "description": "人物名称",
+                "type": "string",
+                "default": "",
+                "hint": "例如：可可子"
+              },
+              "aliases": {
+                "description": "别名",
+                "type": "list",
+                "default": [],
+                "items": {
+                  "type": "string"
+                },
+                "hint": "例如：可可、Coco。过短的单字别名不会自动匹配。"
+              },
+              "reference_images": {
+                "description": "参考图片",
+                "type": "file",
+                "default": [],
+                "file_types": [
+                  "png",
+                  "jpg",
+                  "jpeg",
+                  "webp"
+                ],
+                "hint": "本角色位拥有独立的图片库，其他角色的图片不会出现在这里。建议清晰正脸或角色设定图；可上传多张。多个角色同框时默认每人只取第 1 张。"
+              },
+              "prompt_note": {
+                "description": "人物补充设定",
+                "type": "text",
+                "default": "",
+                "hint": "例如固定发色、服装或不要改变的特征。"
+              }
+            }
+          },
+          "c12": {
+            "name": "角色位 12",
+            "hint": "独立的角色图库：每个角色位对应一个专属图片文件夹，互不可见。新增角色时请选择一个尚未使用的角色位。",
+            "display_item": "name",
+            "hide_hint_in_list": true,
+            "items": {
+              "enabled": {
+                "description": "启用",
+                "type": "bool",
+                "default": true
+              },
+              "name": {
+                "description": "人物名称",
+                "type": "string",
+                "default": "",
+                "hint": "例如：可可子"
+              },
+              "aliases": {
+                "description": "别名",
+                "type": "list",
+                "default": [],
+                "items": {
+                  "type": "string"
+                },
+                "hint": "例如：可可、Coco。过短的单字别名不会自动匹配。"
+              },
+              "reference_images": {
+                "description": "参考图片",
+                "type": "file",
+                "default": [],
+                "file_types": [
+                  "png",
+                  "jpg",
+                  "jpeg",
+                  "webp"
+                ],
+                "hint": "本角色位拥有独立的图片库，其他角色的图片不会出现在这里。建议清晰正脸或角色设定图；可上传多张。多个角色同框时默认每人只取第 1 张。"
+              },
+              "prompt_note": {
+                "description": "人物补充设定",
+                "type": "text",
+                "default": "",
+                "hint": "例如固定发色、服装或不要改变的特征。"
+              }
+            }
+          },
+          "character": {
+            "name": "人物参考（旧版共享图库）",
+            "hint": "旧版兼容模板：此模板下的所有条目共用同一个图片库。新增角色请改用上方带编号的角色位。",
+            "display_item": "name",
+            "hide_hint_in_list": true,
+            "items": {
+              "enabled": {
+                "description": "启用",
+                "type": "bool",
+                "default": true
+              },
+              "name": {
+                "description": "人物名称",
+                "type": "string",
+                "default": "",
+                "hint": "例如：可可子"
+              },
+              "aliases": {
+                "description": "别名",
+                "type": "list",
+                "default": [],
+                "items": {
+                  "type": "string"
+                },
+                "hint": "例如：可可、Coco。过短的单字别名不会自动匹配。"
+              },
+              "reference_images": {
+                "description": "参考图片",
+                "type": "file",
+                "default": [],
+                "file_types": [
+                  "png",
+                  "jpg",
+                  "jpeg",
+                  "webp"
+                ],
+                "hint": "本角色位拥有独立的图片库，其他角色的图片不会出现在这里。建议清晰正脸或角色设定图；可上传多张。多个角色同框时默认每人只取第 1 张。"
               },
               "prompt_note": {
                 "description": "人物补充设定",
@@ -293,7 +891,8 @@
               }
             }
           }
-        }
+        },
+        "hint": "每个「角色位」拥有独立的图片库，角色之间互不可见。用户提示词提到人物名或别名时，插件自动改走 /v1/images/edits 并携带对应图片。"
       },
       "strict_references": {
         "description": "参考缺失时拒绝生图",
@@ -304,7 +903,30 @@
       "max_reference_images": {
         "description": "单次最多携带参考图",
         "type": "int",
-        "default": 4
+        "default": 4,
+        "hint": "同框人物数超过该上限时，多出的人物无法携带参考图；「参考缺失时拒绝生图」开启时会直接拒绝。"
+      },
+      "multi_character_image_limit": {
+        "description": "多角色时每角色参考图上限",
+        "type": "int",
+        "default": 1,
+        "hint": "两个及以上角色同框时，每个角色最多携带此数量的参考图。默认 1 张最容易让模型分清角色；单角色场景不受影响，仍可携带多张。"
+      },
+      "reference_mode": {
+        "description": "参考图上传模式",
+        "type": "string",
+        "default": "auto",
+        "options": [
+          "auto",
+          "multi",
+          "sheet"
+        ],
+        "labels": [
+          "自动（多角色拼合，单角色多图）",
+          "分别上传多图",
+          "始终拼合成一张"
+        ],
+        "hint": "多角色同框时，把所有参考图拼成一张格子图再上传，能显著减少漏画角色、角色合并等问题；分别上传多图保留更高清晰度，但部分网关对多图支持不稳。"
       },
       "max_image_size_mb": {
         "description": "单张参考图大小上限（MB）",
@@ -331,14 +953,18 @@
         "description": "用户白名单",
         "type": "list",
         "default": [],
-        "items": {"type": "string"},
+        "items": {
+          "type": "string"
+        },
         "hint": "留空允许所有用户；填写平台 sender_id（如 QQ 号）后只允许清单内用户。"
       },
       "denied_group_ids": {
         "description": "禁用群列表",
         "type": "list",
         "default": [],
-        "items": {"type": "string"},
+        "items": {
+          "type": "string"
+        },
         "hint": "填写平台 group_id（如 QQ 群号）。"
       }
     }
