@@ -98,7 +98,7 @@ def test_llm_tool_returns_before_background_generation_finishes() -> None:
                 self.sent.append(message)
 
         event = Event()
-        result = await plugin.generate_image(event, "test prompt")
+        result = await plugin.generate_image(event, "雨后的城市车站，电影感光影")
         assert result.startswith("自定义受理话术\n本次尺寸：816x816")
         assert "当前队列：全局 1 个" in result
         assert "预计生成约 3 分钟" in result
@@ -117,7 +117,7 @@ def test_llm_tool_returns_before_background_generation_finishes() -> None:
     asyncio.run(scenario())
 
 
-def test_llm_tool_preserves_original_chinese_prompt_and_reference_text() -> None:
+def test_llm_tool_uses_ai_generated_chinese_prompt_and_keeps_reference_text() -> None:
     async def scenario() -> None:
         _install_astrbot_stubs()
         sys.modules.pop("astrbot_plugin_img_gener.main", None)
@@ -160,23 +160,56 @@ def test_llm_tool_preserves_original_chinese_prompt_and_reference_text() -> None
                 return None
 
             def get_message_str(self):
-                return "\u8bf7\u753b\u53ef\u53ef\u5b50\u5728\u96e8\u540e\u7684\u8f66\u7ad9\u6491\u900f\u660e\u4f1e"
+                return "请帮我画一张可可子在雨后的车站撑透明伞，竖图"
 
         event = Event()
+        generated_prompt = (
+            "雨后的火车站站台，可可子手持透明雨伞，地面倒映暖色灯光，"
+            "细腻日系插画，竖向构图"
+        )
         result = await plugin.generate_image(
             event,
-            "Coco at a rainy train station holding a transparent umbrella",
+            generated_prompt,
         )
         await asyncio.sleep(0)
 
-        assert "\u53ef\u53ef\u5b50" in received["prompt"]
+        assert received["prompt"] == generated_prompt
         assert received["reference_prompt"] == (
-            "\u8bf7\u753b\u53ef\u53ef\u5b50\u5728\u96e8\u540e\u7684\u8f66\u7ad9\u6491\u900f\u660e\u4f1e"
+            "请帮我画一张可可子在雨后的车站撑透明伞，竖图\n"
+            + generated_prompt
         )
-        assert "Coco" not in received["prompt"]
+        assert "请帮我画一张" not in received["prompt"]
 
         release.set()
         await next(iter(plugin._background_tasks))
+
+    asyncio.run(scenario())
+
+
+def test_llm_tool_rejects_non_chinese_generated_prompt() -> None:
+    async def scenario() -> None:
+        _install_astrbot_stubs()
+        sys.modules.pop("astrbot_plugin_img_gener.main", None)
+        module = importlib.import_module("astrbot_plugin_img_gener.main")
+        plugin = object.__new__(module.GPTImageGeneratorPlugin)
+        plugin._background_tasks = set()
+        plugin._active_jobs = {}
+        plugin._next_job_id = 0
+        plugin.config = {}
+        plugin._is_allowed = lambda event: True
+
+        class Event:
+            def get_message_str(self):
+                return "请帮我画一张雨后的车站"
+
+        result = await plugin.generate_image(
+            Event(),
+            "A rainy train station with cinematic lighting",
+        )
+
+        assert "中文提示词" in result
+        assert plugin._background_tasks == set()
+        assert plugin._active_jobs == {}
 
     asyncio.run(scenario())
 

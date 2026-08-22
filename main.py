@@ -383,16 +383,14 @@ class GPTImageGeneratorPlugin(Star):
     def _effective_tool_prompt(
         self, prompt: str, original_message: str
     ) -> tuple[str, str]:
-        """Keep Chinese user intent when the tool model translated it to English."""
+        """Use the AI-authored prompt; keep raw user text only for reference matching.
 
+        The original chat message can contain conversational instructions or other
+        context that is unsuitable as an image prompt, so it must never replace
+        the prompt prepared by the tool-calling model.
+        """
         tool_prompt = str(prompt or "").strip()
         original = str(original_message or "").strip()
-        if (
-            original
-            and self._contains_cjk(original)
-            and not self._contains_cjk(tool_prompt)
-        ):
-            return original, original
         return tool_prompt, "\n".join(item for item in (original, tool_prompt) if item)
 
     def _is_allowed(self, event: AstrMessageEvent) -> bool:
@@ -642,7 +640,7 @@ class GPTImageGeneratorPlugin(Star):
         vision_prompt = (
             "请用 1~3 句话简短评价下面这张 AI 生成的图片："
             "描述画面内容与风格，并判断是否贴合用户需求，语气自然、口语化。\n"
-            f"用户原始需求：{prompt}"
+            f"实际生图提示词：{prompt}"
         )
         try:
             text = await client.chat_completion_vision(
@@ -857,8 +855,12 @@ class GPTImageGeneratorPlugin(Star):
     ) -> str:
         """Submit one image generation request to GPT Image 2 and return immediately.
 
-        Use this tool only when the user clearly asks to create an image. Keep the
-        user's visual intent in prompt. The plugin performs safety review and rate
+        Use this tool only when the user clearly asks to create an image. First
+        rewrite the user's request into a complete, directly usable CHINESE image
+        prompt. Do not copy the conversational message verbatim and do not translate
+        the prompt to English. Remove request wrappers such as “帮我画一张”, while
+        preserving requested subjects, composition, actions, style, lighting,
+        colors, text, and constraints. The plugin performs safety review and rate
         limiting. Configured character names such as 可可子 or 菌菌 are detected
         automatically and their stored reference images are attached.
 
@@ -869,7 +871,7 @@ class GPTImageGeneratorPlugin(Star):
         image, the prompt, and a short evaluation as separate messages.
 
         Args:
-            prompt(string): Complete visual description for the requested image.
+            prompt(string): AI-prepared complete Chinese image prompt; never the raw conversational request.
             size(string): Optional allowed output size; use 816x816 for a small fast square draft.
             quality(string): Optional quality: auto, low, medium, or high.
             characters(array): Optional configured character names; omit to auto-detect names and aliases from prompt.
@@ -882,6 +884,11 @@ class GPTImageGeneratorPlugin(Star):
         )
         if not effective_prompt:
             return "请提供需要生成的画面描述。"
+        if not self._contains_cjk(effective_prompt):
+            return (
+                "请先将用户需求整理成完整、可直接生图的中文提示词，再调用 "
+                "generate_image；不要传入英文提示词，也不要直接复制用户原话。"
+            )
         try:
             selected_size = self._normalize_size(size)
         except ImageGeneratorError as exc:
