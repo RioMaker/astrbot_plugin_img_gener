@@ -20,6 +20,7 @@ class CharacterReference:
 class ResolvedReferences:
     characters: tuple[CharacterReference, ...]
     image_paths: tuple[Path, ...]
+    image_character_names: tuple[str, ...]
     missing_characters: tuple[str, ...]
     unknown_requested_names: tuple[str, ...]
     capped_characters: tuple[str, ...] = ()
@@ -208,6 +209,7 @@ class CharacterReferenceManager:
                     selected.append(character)
 
         images: list[Path] = []
+        image_character_names: list[str] = []
         used: set[Path] = set()
         missing: list[str] = []
         capped: list[str] = []
@@ -233,6 +235,7 @@ class CharacterReferenceManager:
                 continue
             first = next((path for path in usable if path not in used), usable[0])
             images.append(first)
+            image_character_names.append(character.name)
             used.add(first)
             next_index[character] = 1
 
@@ -256,6 +259,7 @@ class CharacterReferenceManager:
                         progressed = True
                         continue
                     images.append(path)
+                    image_character_names.append(character.name)
                     used.add(path)
                     next_index[character] = index + 1
                     remaining -= 1
@@ -266,6 +270,7 @@ class CharacterReferenceManager:
         return ResolvedReferences(
             characters=tuple(selected),
             image_paths=tuple(images),
+            image_character_names=tuple(image_character_names),
             missing_characters=tuple(missing),
             unknown_requested_names=tuple(unknown),
             capped_characters=tuple(capped),
@@ -273,64 +278,54 @@ class CharacterReferenceManager:
 
     @staticmethod
     def augment_prompt(
-        prompt: str, resolved: ResolvedReferences, *, use_sheet: bool = False
+        prompt: str,
+        resolved: ResolvedReferences,
+        *,
+        use_sheet: bool = False,
+        reference_filenames: tuple[str, ...] = (),
     ) -> str:
         if not resolved.characters:
             return prompt
-        lines = [prompt.strip(), "", "角色参考图使用规则："]
-        names = "、".join(character.name for character in resolved.characters)
-        lines.append(
-            f"画面中必须完整出现以下 {len(resolved.characters)} 个角色"
-            f"（共 {len(resolved.characters)} 个，缺一不可）：{names}。"
-            "不得省略或替换任何角色，也不要把多个角色合并成同一个人。"
-        )
-        if use_sheet:
-            lines.append(
-                "上传的是一张拼合参考图，格子按从左到右、从上到下排列；"
-                "请按格子顺序对应下列角色。"
-            )
-        elif len(resolved.characters) == 2:
-            lines.append("若用户未指定构图，可让两个角色左右并排、各自独立。")
-        image_index = 1
-        for character in resolved.characters:
-            usable_count = sum(
-                1 for path in character.image_paths if path in resolved.image_paths
-            )
-            if usable_count <= 0:
-                if character.prompt_note:
-                    lines.append(
-                        f"- 角色「{character.name}」未携带参考图，"
-                        f"请严格按以下设定绘制：{character.prompt_note}"
-                    )
-                continue
-            end = image_index + usable_count - 1
-            if use_sheet:
-                if usable_count == 1 and image_index in {1, 2}:
-                    position = "（左）" if image_index == 1 else "（右）"
-                    image_label = f"第 {image_index} 格{position}"
+        lines = [prompt.strip()]
+        if resolved.image_paths:
+            lines.extend(["", "人物参考图身份映射："])
+            for index, character_name in enumerate(
+                resolved.image_character_names, start=1
+            ):
+                ref_id = f"REF-{index:02d}"
+                if use_sheet:
+                    location = f"拼合图第 {index} 格"
+                elif index <= len(reference_filenames):
+                    location = f"文件 {reference_filenames[index - 1]}"
                 else:
-                    image_label = (
-                        f"第 {image_index} 格"
-                        if image_index == end
-                        else f"第 {image_index}-{end} 格"
-                    )
-            else:
-                image_label = (
-                    f"第 {image_index} 张参考图"
-                    if image_index == end
-                    else f"第 {image_index}-{end} 张参考图"
+                    location = f"上传的第 {index} 张参考图"
+                lines.append(
+                    f"- {ref_id}（{location}）= 角色「{character_name}」"
                 )
-            line = (
-                f"- {image_label} 对应角色「{character.name}」；"
-                "保持其身份、脸部和核心外观一致。"
+
+            if len(resolved.characters) > 1:
+                names = "、".join(
+                    character.name for character in resolved.characters
+                )
+                lines.append(
+                    f"- 画面需包含这些独立角色：{names}；"
+                    "不得遗漏、替换、合并角色，也不得互换或混合各 REF 的身份。"
+                )
+            lines.append(
+                "- 对有参考图的角色，以对应 REF 图像作为人物身份与外观的最高优先级依据；"
+                "除非上方中文生图提示词明确要求改变，否则尽量保持引用图片中的人物原样，"
+                "不要依据补充文字重新设计或自行添加外观设定。"
             )
-            if character.prompt_note:
-                line += f" 补充设定：{character.prompt_note}"
-            lines.append(line)
-            image_index = end + 1
-        lines.append(
-            "参考图仅用于确定每个角色各自的外观；"
-            "不要把不同角色的身份特征混合到同一个人身上。"
-        )
+
+        # prompt_note is only a fallback for a character whose image is unusable
+        # and whose request was allowed to continue with strict_references off.
+        missing = set(resolved.missing_characters) | set(resolved.capped_characters)
+        fallback_lines = [
+            f"- 角色「{character.name}」未携带可用参考图：{character.prompt_note}"
+            for character in resolved.characters
+            if character.name in missing and character.prompt_note
+        ]
+        if fallback_lines:
+            lines.extend(["", "无可用参考图的人物文字后备设定：", *fallback_lines])
         return "\n".join(lines)
 

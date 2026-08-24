@@ -37,11 +37,14 @@ def test_build_contact_sheet_accepts_in_memory_sources(tmp_path) -> None:
         [
             ("first.png", first.read_bytes(), "image/png"),
             ("second.png", second.read_bytes(), "image/png"),
-        ]
+        ],
+        labels=["REF-01 | 可可子", "REF-02 | 菌菌"],
     )
 
     image = Image.open(io.BytesIO(sheet.content))
     assert image.size == (2048, 1024)
+    assert image.getpixel((100, 1000)) == (24, 24, 24)
+    assert image.getpixel((1124, 1000)) == (24, 24, 24)
 
 
 def test_build_contact_sheet_rejects_empty_input(tmp_path) -> None:

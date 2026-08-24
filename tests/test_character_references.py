@@ -34,11 +34,19 @@ def test_auto_detects_names_and_aliases(tmp_path) -> None:
     resolved = manager.resolve("画可可和菌菌在咖啡店聊天")
     assert resolved.names == ("可可子", "菌菌")
     assert resolved.image_paths == (coco.resolve(), mushroom.resolve())
-    augmented = manager.augment_prompt("原始提示", resolved)
-    assert "必须完整出现以下 2 个角色" in augmented
-    assert "缺一不可" in augmented
-    assert "第 1 张参考图 对应角色「可可子」" in augmented
-    assert "第 2 张参考图 对应角色「菌菌」" in augmented
+    assert resolved.image_character_names == ("可可子", "菌菌")
+    augmented = manager.augment_prompt(
+        "原始提示",
+        resolved,
+        reference_filenames=(
+            "reference_01_可可子.png",
+            "reference_02_菌菌.png",
+        ),
+    )
+    assert "REF-01（文件 reference_01_可可子.png）= 角色「可可子」" in augmented
+    assert "REF-02（文件 reference_02_菌菌.png）= 角色「菌菌」" in augmented
+    assert "不得遗漏、替换、合并角色" in augmented
+    assert "紫色短发" not in augmented
 
 
 def test_multi_character_defaults_to_one_image_per_character(tmp_path) -> None:
@@ -67,9 +75,10 @@ def test_multi_character_defaults_to_one_image_per_character(tmp_path) -> None:
     )
     resolved = manager.resolve("可可子和菌菌同框")
     assert resolved.image_paths == (coco_a.resolve(), mushroom_a.resolve())
+    assert resolved.image_character_names == ("可可子", "菌菌")
     augmented = manager.augment_prompt("原始提示", resolved)
-    assert "第 1 张参考图 对应角色「可可子」" in augmented
-    assert "第 2 张参考图 对应角色「菌菌」" in augmented
+    assert "REF-01（上传的第 1 张参考图）= 角色「可可子」" in augmented
+    assert "REF-02（上传的第 2 张参考图）= 角色「菌菌」" in augmented
 
 
 def test_single_character_still_carries_multiple_images(tmp_path) -> None:
@@ -90,8 +99,11 @@ def test_single_character_still_carries_multiple_images(tmp_path) -> None:
     )
     resolved = manager.resolve("画可可子")
     assert resolved.image_paths == tuple(path.resolve() for path in images)
+    assert resolved.image_character_names == ("可可子", "可可子", "可可子")
     augmented = manager.augment_prompt("原始提示", resolved)
-    assert "第 1-3 张参考图" in augmented
+    assert "REF-01" in augmented
+    assert "REF-02" in augmented
+    assert "REF-03" in augmented
 
 
 def test_sheet_mode_designates_cells_by_grid_order(tmp_path) -> None:
@@ -114,15 +126,13 @@ def test_sheet_mode_designates_cells_by_grid_order(tmp_path) -> None:
     )
     resolved = manager.resolve("可可子和菌菌同框")
     augmented = manager.augment_prompt("原始提示", resolved, use_sheet=True)
-    assert "拼合参考图" in augmented
-    assert "第 1 格（左）" in augmented
-    assert "第 2 格（右）" in augmented
-    assert "对应角色「可可子」" in augmented
-    assert "对应角色「菌菌」" in augmented
-    assert "绿色头发" in augmented
+    assert "REF-01（拼合图第 1 格）= 角色「可可子」" in augmented
+    assert "REF-02（拼合图第 2 格）= 角色「菌菌」" in augmented
+    assert "绿色头发" not in augmented
+    assert "尽量保持引用图片中的人物原样" in augmented
 
 
-def test_two_character_multi_mode_adds_side_by_side_hint(tmp_path) -> None:
+def test_two_character_prompt_does_not_override_user_composition(tmp_path) -> None:
     coco = tmp_path / "coco.png"
     mushroom = tmp_path / "mushroom.png"
     _fake_png(coco)
@@ -137,7 +147,52 @@ def test_two_character_multi_mode_adds_side_by_side_hint(tmp_path) -> None:
     )
     resolved = manager.resolve("可可子和菌菌同框")
     augmented = manager.augment_prompt("原始提示", resolved)
-    assert "左右并排" in augmented
+    assert "左右并排" not in augmented
+
+
+def test_user_change_request_is_kept_without_injecting_prompt_note(tmp_path) -> None:
+    image = tmp_path / "coco.png"
+    _fake_png(image)
+    manager = CharacterReferenceManager(
+        [
+            {
+                "name": "可可子",
+                "reference_images": [str(image)],
+                "prompt_note": "固定穿蓝色制服",
+            }
+        ],
+        data_dir=tmp_path,
+        plugin_dir=tmp_path,
+    )
+    resolved = manager.resolve("把可可子的衣服改成红色礼服")
+
+    augmented = manager.augment_prompt(
+        "把可可子的衣服改成红色礼服", resolved
+    )
+
+    assert augmented.startswith("把可可子的衣服改成红色礼服")
+    assert "固定穿蓝色制服" not in augmented
+    assert "除非上方中文生图提示词明确要求改变" in augmented
+
+
+def test_prompt_note_is_only_used_when_reference_image_is_missing(tmp_path) -> None:
+    manager = CharacterReferenceManager(
+        [
+            {
+                "name": "可可子",
+                "reference_images": [str(tmp_path / "missing.png")],
+                "prompt_note": "紫色短发和星形发夹",
+            }
+        ],
+        data_dir=tmp_path,
+        plugin_dir=tmp_path,
+    )
+    resolved = manager.resolve("画可可子")
+
+    augmented = manager.augment_prompt("画可可子", resolved)
+
+    assert "无可用参考图的人物文字后备设定" in augmented
+    assert "紫色短发和星形发夹" in augmented
 
 
 def test_characters_beyond_global_cap_are_reported(tmp_path) -> None:
@@ -154,6 +209,7 @@ def test_characters_beyond_global_cap_are_reported(tmp_path) -> None:
     resolved = manager.resolve("合影", ["甲", "乙", "丙", "丁", "戊"])
     assert resolved.capped_characters == ("戊",)
     assert len(resolved.image_paths) == 4
+    assert resolved.image_character_names == ("甲", "乙", "丙", "丁")
     assert "甲" in manager.augment_prompt("原始提示", resolved)
 
 
@@ -212,4 +268,5 @@ def test_resolve_can_reserve_reference_capacity_for_quoted_images(tmp_path) -> N
 
     assert resolved.names == ("甲角色", "乙角色")
     assert resolved.image_paths == (first.resolve(),)
+    assert resolved.image_character_names == ("甲角色",)
     assert resolved.capped_characters == ("乙角色",)

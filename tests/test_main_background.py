@@ -263,8 +263,8 @@ def test_quoted_reply_images_are_loaded_as_reference_sources(tmp_path) -> None:
             count=1,
             use_sheet=True,
         )
-        assert "第 2 格" in augmented
-        assert "引用的历史聊天消息" in augmented
+        assert "REF-02（拼合图第 2 格）" in augmented
+        assert "用户引用的历史聊天图片" in augmented
 
     asyncio.run(scenario())
 
@@ -371,9 +371,10 @@ def test_generation_uploads_quoted_reply_image(tmp_path) -> None:
         result = await plugin._generate_image(event, "参考引用图片绘制雨夜街道")
 
         assert result is None
-        assert captured["sources"][0][0] == "quoted_1.png"
+        assert captured["sources"][0][0] == "reference_01_user_quote_01.png"
         assert captured["sources"][0][1] == quoted_path.read_bytes()
-        assert "用户引用图片使用规则" in captured["prompt"]
+        assert "用户引用图片映射" in captured["prompt"]
+        assert "REF-01（文件 reference_01_user_quote_01.png）" in captured["prompt"]
         assert plugin.rate_limiter.completed == ["lease-1"]
         assert plugin.rate_limiter.canceled == []
         assert len(event.sent) == 1

@@ -5,6 +5,7 @@ import binascii
 import ipaddress
 import json
 import mimetypes
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -174,16 +175,32 @@ class OpenAICompatibleImageClient:
         return await self._parse_image_response(data)
 
     @staticmethod
-    def source_from_paths(paths: tuple[Path, ...]) -> list[tuple[str, bytes, str]]:
+    def _safe_reference_label(label: str) -> str:
+        value = re.sub(r'[\x00-\x1f<>:"/\\|?*]+', "_", str(label))
+        value = re.sub(r"\s+", "_", value).strip(" ._")
+        return value[:48] or "character"
+
+    @classmethod
+    def source_from_paths(
+        cls,
+        paths: tuple[Path, ...],
+        *,
+        labels: tuple[str, ...] = (),
+    ) -> list[tuple[str, bytes, str]]:
         sources: list[tuple[str, bytes, str]] = []
         for index, path in enumerate(paths, start=1):
             media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
             suffix = Path(path.name).suffix.lower()
             if suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
                 suffix = ".png"
-            # Numbered filenames keep upload order aligned with the prompt's
-            # "第 N 张参考图" designation, which some gateways pass through.
-            sources.append((f"reference_{index}{suffix}", path.read_bytes(), media_type))
+            if index <= len(labels):
+                safe_label = cls._safe_reference_label(labels[index - 1])
+                filename = f"reference_{index:02d}_{safe_label}{suffix}"
+            else:
+                # Preserve the legacy generic name for callers that do not
+                # provide an explicit image-to-character mapping.
+                filename = f"reference_{index}{suffix}"
+            sources.append((filename, path.read_bytes(), media_type))
         return sources
 
     async def edit(

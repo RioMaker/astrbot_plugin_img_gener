@@ -99,6 +99,22 @@ def test_upstream_error_keeps_operation_status_and_request_id() -> None:
     )
 
 
+def test_reference_sources_include_safe_character_names(tmp_path) -> None:
+    first = tmp_path / "coco.png"
+    second = tmp_path / "mushroom.jpg"
+    first.write_bytes(PNG)
+    second.write_bytes(b"\xff\xd8\xff" + b"payload")
+
+    sources = _client().source_from_paths(
+        (first, second), labels=("可可子", "菌/菌:*?")
+    )
+
+    assert [name for name, _, _ in sources] == [
+        "reference_01_可可子.png",
+        "reference_02_菌_菌.jpg",
+    ]
+
+
 def test_edit_uploads_numbered_reference_files(tmp_path, monkeypatch) -> None:
     client = _client()
     first = tmp_path / "coco.png"

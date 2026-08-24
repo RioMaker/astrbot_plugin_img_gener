@@ -460,21 +460,28 @@ class GPTImageGeneratorPlugin(Star):
         start_index: int,
         count: int,
         use_sheet: bool,
+        source_names: tuple[str, ...] = (),
     ) -> str:
         if count <= 0:
             return prompt
-        end_index = start_index + count - 1
-        unit = "格" if use_sheet else "张参考图"
-        label = (
-            f"第 {start_index} {unit}"
-            if start_index == end_index
-            else f"第 {start_index}-{end_index} {unit}"
+        lines = [prompt.rstrip(), "", "用户引用图片映射："]
+        for offset in range(count):
+            ref_index = start_index + offset
+            ref_id = f"REF-{ref_index:02d}"
+            if use_sheet:
+                location = f"拼合图第 {ref_index} 格"
+            elif offset < len(source_names):
+                location = f"文件 {source_names[offset]}"
+            else:
+                location = f"上传的第 {ref_index} 张参考图"
+            lines.append(
+                f"- {ref_id}（{location}）= 用户引用的历史聊天图片"
+            )
+        lines.append(
+            "- 按上方中文生图提示词使用这些 REF；若作为人物参考且提示词未明确要求改变，"
+            "尽量保持引用图片中的人物原样，不要自行补充或重新设计其外观。"
         )
-        return (
-            f"{prompt.rstrip()}\n\n用户引用图片使用规则：\n"
-            f"- {label}来自用户引用的历史聊天消息，必须作为本次生成的视觉参考；"
-            "请结合中文生图提示词判断其人物、物体、构图或风格用途，不要忽略。"
-        )
+        return "\n".join(lines)
 
     @staticmethod
     def _contains_cjk(text: str) -> bool:
@@ -849,10 +856,24 @@ class GPTImageGeneratorPlugin(Star):
         lease_active = True
         try:
             self._set_job_stage(job_id, "读取引用图片")
-            quoted_sources = await self._load_quoted_image_sources(quoted_components)
-            configured_sources = OpenAICompatibleImageClient.source_from_paths(
-                resolved.image_paths
+            raw_quoted_sources = await self._load_quoted_image_sources(
+                quoted_components
             )
+            configured_sources = OpenAICompatibleImageClient.source_from_paths(
+                resolved.image_paths,
+                labels=resolved.image_character_names,
+            )
+            quoted_sources = [
+                (
+                    f"reference_{len(configured_sources) + offset:02d}_"
+                    f"user_quote_{offset:02d}{Path(name).suffix or '.png'}",
+                    content,
+                    media_type,
+                )
+                for offset, (name, content, media_type) in enumerate(
+                    raw_quoted_sources, start=1
+                )
+            ]
             all_sources = [*configured_sources, *quoted_sources]
             reference_mode = str(
                 self._get("references", "reference_mode", default="auto") or "auto"
@@ -866,8 +887,20 @@ class GPTImageGeneratorPlugin(Star):
             ) and len(all_sources) > 1
             sheet = None
             if use_sheet:
+                sheet_labels = [
+                    f"REF-{index:02d} | {character_name}"
+                    for index, character_name in enumerate(
+                        resolved.image_character_names, start=1
+                    )
+                ]
+                sheet_labels.extend(
+                    f"REF-{len(configured_sources) + index:02d} | 用户引用图 {index}"
+                    for index in range(1, len(quoted_sources) + 1)
+                )
                 try:
-                    sheet = build_contact_sheet_from_sources(all_sources)
+                    sheet = build_contact_sheet_from_sources(
+                        all_sources, labels=sheet_labels
+                    )
                 except ImageGeneratorError:
                     logger.warning(
                         "[img_gener] contact sheet build failed, "
@@ -875,7 +908,7 @@ class GPTImageGeneratorPlugin(Star):
                     )
                     use_sheet = False
             sources = (
-                [("contact_sheet.png", sheet.content, sheet.media_type)]
+                [("contact_sheet_REF_map.png", sheet.content, sheet.media_type)]
                 if use_sheet and sheet is not None
                 else all_sources
             )
@@ -888,13 +921,19 @@ class GPTImageGeneratorPlugin(Star):
             )
 
             effective_prompt = CharacterReferenceManager.augment_prompt(
-                raw_prompt, resolved, use_sheet=use_sheet
+                raw_prompt,
+                resolved,
+                use_sheet=use_sheet,
+                reference_filenames=tuple(
+                    name for name, _, _ in configured_sources
+                ),
             )
             effective_prompt = self._augment_quoted_reference_prompt(
                 effective_prompt,
                 start_index=len(configured_sources) + 1,
                 count=len(quoted_sources),
                 use_sheet=use_sheet,
+                source_names=tuple(name for name, _, _ in quoted_sources),
             )
             prompt_prefix = str(
                 self._get("generation", "prompt_prefix", default="") or ""
