@@ -188,3 +188,28 @@ def test_legacy_character_syntax_is_supported(tmp_path) -> None:
     )
     resolved = manager.resolve("可可在公园")
     assert resolved.names == ("可可子",)
+
+
+def test_resolve_can_reserve_reference_capacity_for_quoted_images(tmp_path) -> None:
+    first = tmp_path / "first.png"
+    second = tmp_path / "second.png"
+    _fake_png(first)
+    _fake_png(second)
+    manager = CharacterReferenceManager(
+        [
+            {"name": "甲角色", "reference_images": [str(first)]},
+            {"name": "乙角色", "reference_images": [str(second)]},
+        ],
+        data_dir=tmp_path,
+        plugin_dir=tmp_path,
+        max_total_images=3,
+    )
+
+    resolved = manager.resolve(
+        "甲角色和乙角色同框",
+        max_total_images=1,
+    )
+
+    assert resolved.names == ("甲角色", "乙角色")
+    assert resolved.image_paths == (first.resolve(),)
+    assert resolved.capped_characters == ("乙角色",)

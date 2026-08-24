@@ -25,7 +25,7 @@ try:
         normalize_base_url,
         resolve_secret,
     )
-    from .contact_sheet import build_contact_sheet
+    from .contact_sheet import build_contact_sheet_from_sources
     from .errors import ConfigurationError, ImageGeneratorError
     from .image_client import OpenAICompatibleImageClient
     from .moderation import PromptModerator
@@ -42,7 +42,7 @@ except ImportError:  # pragma: no cover - direct script-style import fallback.
         normalize_base_url,
         resolve_secret,
     )
-    from contact_sheet import build_contact_sheet
+    from contact_sheet import build_contact_sheet_from_sources
     from errors import ConfigurationError, ImageGeneratorError
     from image_client import OpenAICompatibleImageClient
     from moderation import PromptModerator
@@ -376,6 +376,106 @@ class GPTImageGeneratorPlugin(Star):
                 pass
         return str(getattr(event, "message_str", "") or "").strip()
 
+    def _quoted_image_components(self, event: AstrMessageEvent) -> tuple[Any, ...]:
+        """Return Image components embedded in the event's quoted Reply chain."""
+
+        if not self._bool("references", "enable_quoted_images", default=True):
+            return ()
+        getter = getattr(event, "get_messages", None)
+        try:
+            chain = getter() if callable(getter) else event.message_obj.message
+        except Exception:
+            return ()
+        reply_cls = getattr(Comp, "Reply", None)
+        image_cls = getattr(Comp, "Image", None)
+        if reply_cls is None or image_cls is None:
+            return ()
+        images: list[Any] = []
+        for segment in chain or ():
+            if not isinstance(segment, reply_cls):
+                continue
+            for quoted_segment in getattr(segment, "chain", None) or ():
+                if isinstance(quoted_segment, image_cls):
+                    images.append(quoted_segment)
+        return tuple(images)
+
+    @staticmethod
+    def _reference_media_type(content: bytes) -> tuple[str, str]:
+        if content.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image/png", ".png"
+        if content.startswith(b"\xff\xd8\xff"):
+            return "image/jpeg", ".jpg"
+        if content.startswith(b"RIFF") and content[8:12] == b"WEBP":
+            return "image/webp", ".webp"
+        raise ImageGeneratorError(
+            "引用消息中的图片格式不受支持，仅支持 PNG、JPEG 或 WebP。"
+        )
+
+    async def _load_quoted_image_sources(
+        self, components: tuple[Any, ...]
+    ) -> list[tuple[str, bytes, str]]:
+        """Resolve quoted AstrBot Image components and validate their bytes."""
+
+        max_bytes = (
+            self._int("references", "max_image_size_mb", default=12, minimum=1)
+            * 1024
+            * 1024
+        )
+        sources: list[tuple[str, bytes, str]] = []
+        for index, component in enumerate(components, start=1):
+            converter = getattr(component, "convert_to_file_path", None)
+            if not callable(converter):
+                raise ImageGeneratorError(
+                    "当前消息平台无法读取引用图片，请重新发送图片后再试。",
+                    detail="quoted image component misses convert_to_file_path",
+                )
+            try:
+                raw_path = await converter()
+                path = Path(str(raw_path or "")).resolve()
+                if not path.is_file():
+                    raise OSError("resolved image path is not a file")
+                size = path.stat().st_size
+                if size <= 0:
+                    raise OSError("resolved image is empty")
+                if size > max_bytes:
+                    raise ImageGeneratorError(
+                        "引用消息中的图片超过单张大小上限，请压缩后重新发送。"
+                    )
+                content = await asyncio.to_thread(path.read_bytes)
+            except ImageGeneratorError:
+                raise
+            except Exception as exc:
+                raise ImageGeneratorError(
+                    "引用消息中的图片已失效或无法读取，请重新发送图片后再试。",
+                    detail=f"quoted_image={index} error={type(exc).__name__}: {exc}",
+                ) from exc
+            media_type, suffix = self._reference_media_type(content)
+            sources.append((f"quoted_{index}{suffix}", content, media_type))
+        return sources
+
+    @staticmethod
+    def _augment_quoted_reference_prompt(
+        prompt: str,
+        *,
+        start_index: int,
+        count: int,
+        use_sheet: bool,
+    ) -> str:
+        if count <= 0:
+            return prompt
+        end_index = start_index + count - 1
+        unit = "格" if use_sheet else "张参考图"
+        label = (
+            f"第 {start_index} {unit}"
+            if start_index == end_index
+            else f"第 {start_index}-{end_index} {unit}"
+        )
+        return (
+            f"{prompt.rstrip()}\n\n用户引用图片使用规则：\n"
+            f"- {label}来自用户引用的历史聊天消息，必须作为本次生成的视觉参考；"
+            "请结合中文生图提示词判断其人物、物体、构图或风格用途，不要忽略。"
+        )
+
     @staticmethod
     def _contains_cjk(text: str) -> bool:
         return any("\u4e00" <= char <= "\u9fff" for char in text)
@@ -698,9 +798,25 @@ class GPTImageGeneratorPlugin(Star):
         except ImageGeneratorError as exc:
             return exc.public_message
 
+        quoted_components = self._quoted_image_components(event)
+        max_quoted_images = self._int(
+            "references", "max_quoted_images", default=2, minimum=1
+        )
+        if len(quoted_components) > max_quoted_images:
+            return (
+                f"单次最多使用 {max_quoted_images} 张引用消息图片，"
+                "请减少引用图片数量后重试。"
+            )
+        total_reference_limit = self.references.max_total_images
+        if len(quoted_components) > total_reference_limit:
+            return (
+                f"引用消息中有 {len(quoted_components)} 张图片，超过单次参考图上限 "
+                f"{total_reference_limit} 张。"
+            )
         resolved = self.references.resolve(
             "\n".join(item for item in (reference_prompt, raw_prompt) if item),
             characters,
+            max_total_images=total_reference_limit - len(quoted_components),
         )
         if resolved.unknown_requested_names and self._bool(
             "references", "strict_references", default=True
@@ -719,42 +835,6 @@ class GPTImageGeneratorPlugin(Star):
                 + "。请减少同框人物数量，或在插件设置中调大「单次最多携带参考图」。"
             )
 
-        reference_mode = str(
-            self._get("references", "reference_mode", default="auto") or "auto"
-        ).strip().lower()
-        use_sheet = (reference_mode == "sheet" or (
-            reference_mode == "auto" and len(resolved.characters) > 1
-        )) and len(resolved.image_paths) > 1
-        sheet = None
-        if use_sheet:
-            try:
-                sheet = build_contact_sheet(resolved.image_paths)
-            except ImageGeneratorError:
-                logger.warning(
-                    "[img_gener] contact sheet build failed, "
-                    "falling back to separate reference uploads"
-                )
-                use_sheet = False
-        sources = (
-            [("contact_sheet.png", sheet.content, sheet.media_type)]
-            if use_sheet and sheet is not None
-            else OpenAICompatibleImageClient.source_from_paths(resolved.image_paths)
-        )
-        logger.info(
-            "[img_gener] reference upload mode=%s files=%s",
-            "sheet" if use_sheet else "multi",
-            ",".join(name for name, _, _ in sources) or "none",
-        )
-
-        prompt_prefix = str(
-            self._get("generation", "prompt_prefix", default="") or ""
-        ).strip()
-        effective_prompt = CharacterReferenceManager.augment_prompt(
-            raw_prompt, resolved, use_sheet=use_sheet
-        )
-        if prompt_prefix:
-            effective_prompt = f"{prompt_prefix}\n{effective_prompt}"
-
         user_id, group_id = self._identity(event)
         bypass_limits = bool(
             event.is_admin()
@@ -767,8 +847,62 @@ class GPTImageGeneratorPlugin(Star):
             return rate.message
 
         lease_active = True
-        self._set_job_stage(job_id, "安全审核")
         try:
+            self._set_job_stage(job_id, "读取引用图片")
+            quoted_sources = await self._load_quoted_image_sources(quoted_components)
+            configured_sources = OpenAICompatibleImageClient.source_from_paths(
+                resolved.image_paths
+            )
+            all_sources = [*configured_sources, *quoted_sources]
+            reference_mode = str(
+                self._get("references", "reference_mode", default="auto") or "auto"
+            ).strip().lower()
+            use_sheet = (
+                reference_mode == "sheet"
+                or (
+                    reference_mode == "auto"
+                    and (len(resolved.characters) > 1 or bool(quoted_sources))
+                )
+            ) and len(all_sources) > 1
+            sheet = None
+            if use_sheet:
+                try:
+                    sheet = build_contact_sheet_from_sources(all_sources)
+                except ImageGeneratorError:
+                    logger.warning(
+                        "[img_gener] contact sheet build failed, "
+                        "falling back to separate reference uploads"
+                    )
+                    use_sheet = False
+            sources = (
+                [("contact_sheet.png", sheet.content, sheet.media_type)]
+                if use_sheet and sheet is not None
+                else all_sources
+            )
+            logger.info(
+                "[img_gener] reference upload mode=%s files=%s configured=%s quoted=%s",
+                "sheet" if use_sheet else "multi",
+                ",".join(name for name, _, _ in sources) or "none",
+                len(configured_sources),
+                len(quoted_sources),
+            )
+
+            effective_prompt = CharacterReferenceManager.augment_prompt(
+                raw_prompt, resolved, use_sheet=use_sheet
+            )
+            effective_prompt = self._augment_quoted_reference_prompt(
+                effective_prompt,
+                start_index=len(configured_sources) + 1,
+                count=len(quoted_sources),
+                use_sheet=use_sheet,
+            )
+            prompt_prefix = str(
+                self._get("generation", "prompt_prefix", default="") or ""
+            ).strip()
+            if prompt_prefix:
+                effective_prompt = f"{prompt_prefix}\n{effective_prompt}"
+
+            self._set_job_stage(job_id, "安全审核")
             review = await self.moderator.review(
                 effective_prompt,
                 lambda review_prompt: self._remote_review(event, review_prompt),
@@ -803,10 +937,13 @@ class GPTImageGeneratorPlugin(Star):
             lease_active = False
             output_path = self.output_store.save(generated)
             self._set_job_stage(job_id, "发送图片")
+            reference_parts = []
+            if resolved.names:
+                reference_parts.append("人物参考：" + "、".join(resolved.names))
+            if quoted_sources:
+                reference_parts.append(f"引用图片：{len(quoted_sources)} 张")
             reference_text = (
-                "；已携带人物参考：" + "、".join(resolved.names)
-                if resolved.names
-                else ""
+                "；已携带" + "；".join(reference_parts) if reference_parts else ""
             )
             duration = self._format_duration(time.monotonic() - started_at)
             caption = (
@@ -835,7 +972,15 @@ class GPTImageGeneratorPlugin(Star):
                     )
             return None
         except ImageGeneratorError as exc:
-            logger.warning("[img_gener] generation failed: %s", exc.detail[:800])
+            active_jobs = getattr(self, "_active_jobs", {})
+            job = active_jobs.get(job_id) if job_id is not None else None
+            logger.warning(
+                "[img_gener] generation failed job=%s stage=%s public=%s detail=%s",
+                job_id if job_id is not None else "-",
+                job.stage if job else "unknown",
+                exc.public_message,
+                exc.detail[:1200],
+            )
             return exc.public_message
         except Exception as exc:
             logger.exception("[img_gener] unexpected generation error: %s", exc)
@@ -863,6 +1008,8 @@ class GPTImageGeneratorPlugin(Star):
         colors, text, and constraints. The plugin performs safety review and rate
         limiting. Configured character names such as 可可子 or 菌菌 are detected
         automatically and their stored reference images are attached.
+        Images contained in a quoted/replied historical message are also attached
+        automatically; describe how those images should guide the result in prompt.
 
         IMPORTANT: generation runs in the BACKGROUND and typically takes about 3
         minutes. When this tool returns, the image is NOT ready yet — the request

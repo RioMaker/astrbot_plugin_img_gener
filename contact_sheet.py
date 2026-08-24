@@ -24,29 +24,29 @@ class ContactSheet:
     media_type: str = "image/png"
 
 
-def build_contact_sheet(image_paths: tuple[Path, ...]) -> ContactSheet:
-    """Arrange reference images into one PNG grid so a single image field carries
-    every character, which sidesteps gateways that drop repeated image fields.
-    """
+def build_contact_sheet_from_sources(
+    sources: list[tuple[str, bytes, str]],
+) -> ContactSheet:
+    """Arrange in-memory image upload sources into one PNG grid."""
 
     if Image is None:
         raise ImageGeneratorError(
             "拼合参考图模式需要 Pillow 依赖；请确认插件依赖已完整安装。"
         )
-    if not image_paths:
+    if not sources:
         raise ImageGeneratorError("没有可拼合的参考图。")
-    paths = list(image_paths)[:MAX_SHEET_CELLS]
-    columns = max(1, min(SHEET_COLUMNS, len(paths)))
-    rows = (len(paths) + columns - 1) // columns
+    selected = sources[:MAX_SHEET_CELLS]
+    columns = max(1, min(SHEET_COLUMNS, len(selected)))
+    rows = (len(selected) + columns - 1) // columns
     canvas = Image.new(
         "RGB", (columns * SHEET_CELL_SIZE, rows * SHEET_CELL_SIZE), "white"
     )
-    for index, path in enumerate(paths):
+    for index, (name, content, _media_type) in enumerate(selected):
         try:
-            with Image.open(path) as image:
+            with Image.open(io.BytesIO(content)) as image:
                 prepared = ImageOps.exif_transpose(image).convert("RGB")
         except OSError as exc:
-            raise ImageGeneratorError(f"参考图无法读取：{path.name}") from exc
+            raise ImageGeneratorError(f"参考图无法读取：{name}") from exc
         prepared.thumbnail((SHEET_CELL_SIZE, SHEET_CELL_SIZE), Image.LANCZOS)
         cell_x = (index % columns) * SHEET_CELL_SIZE
         cell_y = (index // columns) * SHEET_CELL_SIZE
@@ -56,3 +56,20 @@ def build_contact_sheet(image_paths: tuple[Path, ...]) -> ContactSheet:
     buffer = io.BytesIO()
     canvas.save(buffer, format="PNG")
     return ContactSheet(content=buffer.getvalue())
+
+
+def build_contact_sheet(image_paths: tuple[Path, ...]) -> ContactSheet:
+    """Arrange reference images into one PNG grid so a single image field carries
+    every character, which sidesteps gateways that drop repeated image fields.
+    """
+
+    if not image_paths:
+        raise ImageGeneratorError("没有可拼合的参考图。")
+    sources: list[tuple[str, bytes, str]] = []
+    for path in image_paths:
+        try:
+            content = path.read_bytes()
+        except OSError as exc:
+            raise ImageGeneratorError(f"参考图无法读取：{path.name}") from exc
+        sources.append((path.name, content, "application/octet-stream"))
+    return build_contact_sheet_from_sources(sources)

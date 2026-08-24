@@ -78,6 +78,27 @@ def test_generation_payload_matches_uuapi() -> None:
     }
 
 
+def test_upstream_error_keeps_operation_status_and_request_id() -> None:
+    client = _client()
+    response = httpx.Response(
+        502,
+        headers={"x-request-id": "req-123"},
+        json={"error": {"message": "Upstream request failed"}},
+    )
+
+    error = client._http_error(
+        response,
+        operation="生图服务",
+        path="/images/generations",
+    )
+
+    assert "HTTP 502" in error.public_message
+    assert error.detail == (
+        "operation=生图服务 path=/images/generations http_status=502 "
+        "request_id=req-123 upstream=Upstream request failed"
+    )
+
+
 def test_edit_uploads_numbered_reference_files(tmp_path, monkeypatch) -> None:
     client = _client()
     first = tmp_path / "coco.png"

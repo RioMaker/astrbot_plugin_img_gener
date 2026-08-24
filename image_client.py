@@ -64,15 +64,55 @@ class OpenAICompatibleImageClient:
         return httpx.Timeout(total, connect=min(20.0, total))
 
     @staticmethod
-    def _error_detail(response: httpx.Response) -> str:
+    def _error_detail(
+        response: httpx.Response, *, operation: str = "", path: str = ""
+    ) -> str:
         try:
             payload = response.json()
             error = payload.get("error", payload) if isinstance(payload, dict) else payload
             if isinstance(error, dict):
-                return str(error.get("message") or error.get("code") or error)[:800]
-            return str(error)[:800]
+                upstream = str(error.get("message") or error.get("code") or error)
+            else:
+                upstream = str(error)
         except Exception:
-            return response.text[:800]
+            upstream = response.text
+
+        parts = []
+        if operation:
+            parts.append(f"operation={operation}")
+        if path:
+            parts.append(f"path={path}")
+        parts.append(f"http_status={response.status_code}")
+        request_id = next(
+            (
+                response.headers.get(name)
+                for name in ("x-request-id", "request-id", "x-trace-id", "cf-ray")
+                if response.headers.get(name)
+            ),
+            "",
+        )
+        if request_id:
+            parts.append(f"request_id={request_id[:160]}")
+        parts.append(f"upstream={upstream[:800]}")
+        return " ".join(parts)[:1200]
+
+    @classmethod
+    def _http_error(
+        cls, response: httpx.Response, *, operation: str, path: str
+    ) -> ImageAPIError:
+        status = response.status_code
+        detail = cls._error_detail(response, operation=operation, path=path)
+        if status in {401, 403}:
+            message = "UUAPI 鉴权失败，请检查 API Key、分组和 User-Agent 设置。"
+        elif status == 429:
+            message = "UUAPI 当前限流或额度不足，请稍后重试。"
+        elif status in {400, 422}:
+            message = f"{operation}拒绝了请求，可能是参数不兼容或内容未通过上游审核。"
+        elif status >= 500:
+            message = f"{operation}上游服务暂时异常（HTTP {status}），请稍后重试。"
+        else:
+            message = f"{operation}返回错误（HTTP {status}）。"
+        return ImageAPIError(message, detail=detail)
 
     async def _post_json(
         self,
@@ -109,16 +149,7 @@ class OpenAICompatibleImageClient:
                 detail=f"operation={operation} path={path} error={type(exc).__name__}: {exc}",
             ) from exc
         if response.status_code >= 400:
-            detail = self._error_detail(response)
-            if response.status_code in {401, 403}:
-                message = "UUAPI 鉴权失败，请检查 API Key、分组和 User-Agent 设置。"
-            elif response.status_code == 429:
-                message = "UUAPI 当前限流或额度不足，请稍后重试。"
-            elif response.status_code in {400, 422}:
-                message = f"{operation}拒绝了请求，可能是参数不兼容或内容未通过上游审核。"
-            else:
-                message = f"{operation}返回错误（HTTP {response.status_code}）。"
-            raise ImageAPIError(message, detail=detail)
+            raise self._http_error(response, operation=operation, path=path)
         try:
             data = response.json()
         except json.JSONDecodeError as exc:
@@ -202,9 +233,10 @@ class OpenAICompatibleImageClient:
                 detail=f"operation=参考图生图 path=/images/edits error={type(exc).__name__}: {exc}",
             ) from exc
         if response.status_code >= 400:
-            raise ImageAPIError(
-                "参考图生图请求失败；请检查图片格式、上传字段和上游内容审核。",
-                detail=self._error_detail(response),
+            raise self._http_error(
+                response,
+                operation="参考图生图",
+                path="/images/edits",
             )
         try:
             payload = response.json()

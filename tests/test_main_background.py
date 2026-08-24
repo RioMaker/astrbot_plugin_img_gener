@@ -31,11 +31,24 @@ def _install_astrbot_stubs() -> None:
             self.context = context
             self.config = config
 
+    class _Image:
+        def __init__(self, path: str):
+            self.path = path
+
+        async def convert_to_file_path(self):
+            return self.path
+
+    class _Reply:
+        def __init__(self, chain=None):
+            self.chain = list(chain or [])
+
     class _Logger:
         def __getattr__(self, name):
             del name
             return lambda *args, **kwargs: None
 
+    components.Image = _Image
+    components.Reply = _Reply
     api.AstrBotConfig = dict
     api.logger = _Logger()
     event_module.AstrMessageEvent = object
@@ -210,6 +223,160 @@ def test_llm_tool_rejects_non_chinese_generated_prompt() -> None:
         assert "中文提示词" in result
         assert plugin._background_tasks == set()
         assert plugin._active_jobs == {}
+
+    asyncio.run(scenario())
+
+
+def test_quoted_reply_images_are_loaded_as_reference_sources(tmp_path) -> None:
+    async def scenario() -> None:
+        _install_astrbot_stubs()
+        sys.modules.pop("astrbot_plugin_img_gener.main", None)
+        module = importlib.import_module("astrbot_plugin_img_gener.main")
+        plugin = object.__new__(module.GPTImageGeneratorPlugin)
+        plugin.config = {
+            "references": {
+                "enable_quoted_images": True,
+                "max_image_size_mb": 1,
+            }
+        }
+        image_path = tmp_path / "quoted.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\nquoted-image")
+        quoted_image = module.Comp.Image(str(image_path))
+
+        class Event:
+            def get_messages(self):
+                return [
+                    module.Comp.Reply(chain=[quoted_image]),
+                    module.Comp.Image(str(image_path)),
+                ]
+
+        components = plugin._quoted_image_components(Event())
+        sources = await plugin._load_quoted_image_sources(components)
+
+        assert components == (quoted_image,)
+        assert sources == [
+            ("quoted_1.png", image_path.read_bytes(), "image/png")
+        ]
+        augmented = plugin._augment_quoted_reference_prompt(
+            "雨夜街道",
+            start_index=2,
+            count=1,
+            use_sheet=True,
+        )
+        assert "第 2 格" in augmented
+        assert "引用的历史聊天消息" in augmented
+
+    asyncio.run(scenario())
+
+
+def test_generation_uploads_quoted_reply_image(tmp_path) -> None:
+    async def scenario() -> None:
+        _install_astrbot_stubs()
+        sys.modules.pop("astrbot_plugin_img_gener.main", None)
+        module = importlib.import_module("astrbot_plugin_img_gener.main")
+        plugin = object.__new__(module.GPTImageGeneratorPlugin)
+        plugin.config = {
+            "references": {
+                "enable_quoted_images": True,
+                "max_quoted_images": 2,
+                "max_image_size_mb": 1,
+                "reference_mode": "multi",
+            },
+            "generation": {"enable_evaluation": False},
+        }
+        plugin._active_jobs = {}
+        plugin.references = module.CharacterReferenceManager(
+            [],
+            data_dir=tmp_path,
+            plugin_dir=tmp_path,
+            max_total_images=4,
+        )
+        plugin.moderator = module.PromptModerator(enabled=False)
+        plugin._is_allowed = lambda event: True
+
+        class RateLimiter:
+            def __init__(self):
+                self.completed = []
+                self.canceled = []
+
+            async def acquire(self, user_id, group_id, *, bypass_limits=False):
+                del user_id, group_id, bypass_limits
+                return types.SimpleNamespace(allowed=True, lease_id="lease-1")
+
+            async def complete(self, lease_id):
+                self.completed.append(lease_id)
+
+            async def cancel(self, lease_id):
+                self.canceled.append(lease_id)
+
+        plugin.rate_limiter = RateLimiter()
+
+        captured = {}
+
+        class ImageClient:
+            async def edit(self, prompt, sources, *, size, quality):
+                captured["prompt"] = prompt
+                captured["sources"] = sources
+                captured["size"] = size
+                captured["quality"] = quality
+                return types.SimpleNamespace(
+                    content=b"\x89PNG\r\n\x1a\ngenerated",
+                    media_type="image/png",
+                    revised_prompt="",
+                    extension=".png",
+                )
+
+            async def generate(self, prompt, *, size, quality):
+                raise AssertionError("quoted image must use /images/edits")
+
+        plugin._client = lambda: ImageClient()
+        plugin.output_store = types.SimpleNamespace(
+            save=lambda image: tmp_path / "generated.png"
+        )
+        plugin._completion_chain = lambda event, caption, path: (caption, path)
+
+        async def no_evaluation(prompt, content, media_type):
+            del prompt, content, media_type
+            return None
+
+        plugin._evaluate_image = no_evaluation
+
+        quoted_path = tmp_path / "quoted.png"
+        quoted_path.write_bytes(b"\x89PNG\r\n\x1a\nquoted")
+        quoted_image = module.Comp.Image(str(quoted_path))
+
+        class Event:
+            def __init__(self):
+                self.sent = []
+
+            def get_messages(self):
+                return [module.Comp.Reply(chain=[quoted_image])]
+
+            def get_platform_name(self):
+                return "qq"
+
+            def get_sender_id(self):
+                return "1"
+
+            def get_group_id(self):
+                return None
+
+            def is_admin(self):
+                return False
+
+            async def send(self, message):
+                self.sent.append(message)
+
+        event = Event()
+        result = await plugin._generate_image(event, "参考引用图片绘制雨夜街道")
+
+        assert result is None
+        assert captured["sources"][0][0] == "quoted_1.png"
+        assert captured["sources"][0][1] == quoted_path.read_bytes()
+        assert "用户引用图片使用规则" in captured["prompt"]
+        assert plugin.rate_limiter.completed == ["lease-1"]
+        assert plugin.rate_limiter.canceled == []
+        assert len(event.sent) == 1
 
     asyncio.run(scenario())
 

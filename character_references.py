@@ -168,8 +168,17 @@ class CharacterReferenceManager:
         return tuple(result)
 
     def resolve(
-        self, prompt: str, requested_names: list[str] | None = None
+        self,
+        prompt: str,
+        requested_names: list[str] | None = None,
+        *,
+        max_total_images: int | None = None,
     ) -> ResolvedReferences:
+        total_limit = (
+            self.max_total_images
+            if max_total_images is None
+            else max(0, min(self.max_total_images, int(max_total_images)))
+        )
         selected: list[CharacterReference] = []
         unknown: list[str] = []
         explicit = [str(item).strip() for item in requested_names or [] if str(item).strip()]
@@ -207,7 +216,7 @@ class CharacterReferenceManager:
         }
         multi_character = len(selected) > 1
         per_character_cap = (
-            self.per_character_limit if multi_character else self.max_total_images
+            self.per_character_limit if multi_character else total_limit
         )
         next_index: dict[CharacterReference, int] = {}
 
@@ -219,7 +228,7 @@ class CharacterReferenceManager:
             if not usable:
                 missing.append(character.name)
                 continue
-            if len(images) >= self.max_total_images:
+            if len(images) >= total_limit:
                 capped.append(character.name)
                 continue
             first = next((path for path in usable if path not in used), usable[0])
@@ -229,7 +238,7 @@ class CharacterReferenceManager:
 
         # Second pass: fill the remaining budget round-robin up to the
         # per-character cap, keeping upload order aligned with prompt numbering.
-        remaining = self.max_total_images - len(images)
+        remaining = total_limit - len(images)
         if remaining > 0:
             active = [character for character in selected if character in next_index]
             while remaining > 0:

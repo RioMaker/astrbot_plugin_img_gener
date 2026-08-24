@@ -3,7 +3,10 @@ from __future__ import annotations
 import io
 
 import pytest
-from astrbot_plugin_img_gener.contact_sheet import build_contact_sheet
+from astrbot_plugin_img_gener.contact_sheet import (
+    build_contact_sheet,
+    build_contact_sheet_from_sources,
+)
 from astrbot_plugin_img_gener.errors import ImageGeneratorError
 
 Image = pytest.importorskip("PIL.Image")
@@ -21,6 +24,23 @@ def test_build_contact_sheet_arranges_cells_in_grid(tmp_path) -> None:
     assert sheet.media_type == "image/png"
     image = Image.open(io.BytesIO(sheet.content))
     assert image.format == "PNG"
+    assert image.size == (2048, 1024)
+
+
+def test_build_contact_sheet_accepts_in_memory_sources(tmp_path) -> None:
+    first = tmp_path / "first.png"
+    second = tmp_path / "second.png"
+    _fake_image(first, color=(200, 30, 30))
+    _fake_image(second, color=(30, 30, 200))
+
+    sheet = build_contact_sheet_from_sources(
+        [
+            ("first.png", first.read_bytes(), "image/png"),
+            ("second.png", second.read_bytes(), "image/png"),
+        ]
+    )
+
+    image = Image.open(io.BytesIO(sheet.content))
     assert image.size == (2048, 1024)
 
 

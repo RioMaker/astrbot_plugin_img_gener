@@ -900,6 +900,18 @@
         "default": true,
         "hint": "开启后，提到已配置人物但其图片失效时不会退化成纯文生图。"
       },
+      "enable_quoted_images": {
+        "description": "携带引用消息中的图片",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，回复或引用一条含图片的历史消息再要求生图时，会把引用链中的图片作为额外参考图上传。"
+      },
+      "max_quoted_images": {
+        "description": "单次最多引用历史图片",
+        "type": "int",
+        "default": 2,
+        "hint": "只统计引用消息中的图片，并与固定人物参考图共同受「单次最多携带参考图」限制。超出时拒绝任务，不会静默漏传。"
+      },
       "max_reference_images": {
         "description": "单次最多携带参考图",
         "type": "int",
