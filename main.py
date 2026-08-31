@@ -27,6 +27,7 @@ try:
     )
     from .contact_sheet import build_contact_sheet_from_sources
     from .errors import ConfigurationError, ImageGeneratorError
+    from .generation_history import GenerationHistoryRecord, GenerationHistoryStore
     from .image_client import OpenAICompatibleImageClient
     from .moderation import PromptModerator
     from .rate_limiter import LimitConfig, PersistentRateLimiter
@@ -44,6 +45,7 @@ except ImportError:  # pragma: no cover - direct script-style import fallback.
     )
     from contact_sheet import build_contact_sheet_from_sources
     from errors import ConfigurationError, ImageGeneratorError
+    from generation_history import GenerationHistoryRecord, GenerationHistoryStore
     from image_client import OpenAICompatibleImageClient
     from moderation import PromptModerator
     from rate_limiter import LimitConfig, PersistentRateLimiter
@@ -76,6 +78,8 @@ class ActiveGenerationJob:
     started_at: float
     size: str = DEFAULT_IMAGE_SIZE
     stage: str = "等待调度"
+    finalized: bool = False
+    history_persisted: bool = False
 
 
 class GPTImageGeneratorPlugin(Star):
@@ -127,6 +131,10 @@ class GPTImageGeneratorPlugin(Star):
         self.rate_limiter = PersistentRateLimiter(
             self.data_dir / "rate_limits.sqlite3", limit_config
         )
+        self.history_store = GenerationHistoryStore(
+            self.data_dir / "generation_history.sqlite3"
+        )
+        self._recovered_history_jobs = self.history_store.recover_unfinished()
         self.references = CharacterReferenceManager(
             self._get("references", "characters", default=[]),
             data_dir=self.data_dir,
@@ -166,12 +174,18 @@ class GPTImageGeneratorPlugin(Star):
 
     async def initialize(self) -> None:
         removed = self.output_store.cleanup()
+        history_removed = self.history_store.cleanup(
+            self._int("storage", "retention_days", default=7, minimum=0)
+        )
         logger.info(
-            "[img_gener] initialized model=%s base_url=%s references=%s cleaned=%s",
+            "[img_gener] initialized model=%s base_url=%s references=%s "
+            "cleaned=%s history_cleaned=%s recovered=%s",
             self._get("api", "model", default="gpt-image-2"),
             normalize_base_url(self._get("api", "base_url", default="https://uuapi.cc/v1")),
             len(self.references.characters),
             removed,
+            history_removed,
+            self._recovered_history_jobs,
         )
 
     async def terminate(self) -> None:
@@ -264,25 +278,126 @@ class GPTImageGeneratorPlugin(Star):
         return event.chain_result(parts)
 
     def _register_job(
-        self, event: AstrMessageEvent, *, source: str, size: str
+        self,
+        event: AstrMessageEvent,
+        *,
+        source: str,
+        size: str,
+        prompt: str = "",
+        quality: str | None = None,
     ) -> tuple[int, float]:
-        self._next_job_id += 1
         user_id, group_id = self._identity(event)
         started_at = time.monotonic()
+        history_store = getattr(self, "history_store", None)
+        job_id = 0
+        history_persisted = False
+        if history_store is not None:
+            try:
+                job_id = history_store.create_job(
+                    user_id=user_id,
+                    group_id=group_id,
+                    source=source,
+                    prompt=prompt,
+                    size=size,
+                    quality=str(quality or "auto"),
+                )
+                history_persisted = job_id > 0
+            except Exception:
+                logger.exception("[img_gener] failed to create history record")
+        if job_id <= 0:
+            self._next_job_id = int(getattr(self, "_next_job_id", 0)) + 1
+            job_id = self._next_job_id
+        else:
+            self._next_job_id = max(int(getattr(self, "_next_job_id", 0)), job_id)
         job = ActiveGenerationJob(
-            job_id=self._next_job_id,
+            job_id=job_id,
             user_id=user_id,
             group_id=group_id,
             source=source,
             started_at=started_at,
             size=size,
+            history_persisted=history_persisted,
         )
         self._active_jobs[job.job_id] = job
         return job.job_id, started_at
 
+    def _record_rejected_attempt(
+        self,
+        event: AstrMessageEvent,
+        *,
+        source: str,
+        prompt: str,
+        size: str,
+        quality: str | None,
+        stage: str,
+        message: str,
+    ) -> str:
+        history_store = getattr(self, "history_store", None)
+        if history_store is None:
+            return message
+        user_id, group_id = self._identity(event)
+        try:
+            job_id = history_store.create_job(
+                user_id=user_id,
+                group_id=group_id,
+                source=source,
+                prompt=prompt,
+                size=size,
+                quality=str(quality or "auto"),
+            )
+            history_store.finish_job(
+                job_id,
+                status="rejected",
+                stage=stage,
+                result_message=message,
+            )
+        except Exception:
+            logger.exception("[img_gener] failed to record rejected attempt")
+        return message
+
     def _set_job_stage(self, job_id: int | None, stage: str) -> None:
-        if job_id is not None and job_id in self._active_jobs:
-            self._active_jobs[job_id].stage = stage
+        if job_id is None or job_id not in self._active_jobs:
+            return
+        job = self._active_jobs[job_id]
+        if job.finalized:
+            return
+        job.stage = stage
+        history_store = getattr(self, "history_store", None)
+        if history_store is not None and job.history_persisted:
+            try:
+                history_store.update_stage(job_id, stage)
+            except Exception:
+                logger.exception("[img_gener] failed to update history stage job=%s", job_id)
+
+    def _finalize_job(
+        self,
+        job_id: int | None,
+        *,
+        status: str,
+        stage: str,
+        result_message: str = "",
+        output_filename: str = "",
+    ) -> None:
+        if job_id is None:
+            return
+        job = self._active_jobs.get(job_id)
+        if job is not None:
+            if job.finalized:
+                return
+            job.stage = stage
+            job.finalized = True
+        history_store = getattr(self, "history_store", None)
+        if history_store is not None and job is not None and job.history_persisted:
+            try:
+                history_store.finish_job(
+                    job_id,
+                    status=status,
+                    stage=stage,
+                    result_message=result_message,
+                    output_filename=output_filename,
+                )
+            except Exception:
+                logger.exception("[img_gener] failed to finalize history job=%s", job_id)
 
     def _finish_job(self, job_id: int | None) -> None:
         if job_id is not None:
@@ -306,6 +421,225 @@ class GPTImageGeneratorPlugin(Star):
             ),
             "visible": visible,
         }
+
+    @staticmethod
+    def _remaining_text(value: int) -> str:
+        return "不限" if value < 0 else f"{value} 次"
+
+    @classmethod
+    def _cooldown_text(cls, seconds: int) -> str:
+        return "已结束，可立即调用" if seconds <= 0 else f"还需 {cls._format_duration(seconds)}"
+
+    @staticmethod
+    def _history_status_label(status: str) -> str:
+        return {
+            "queued": "等待中",
+            "running": "处理中",
+            "succeeded": "成功",
+            "rejected": "未受理",
+            "failed": "失败",
+            "delivery_failed": "已生成但发送失败",
+            "cancelled": "已取消",
+            "interrupted": "已中断",
+        }.get(status, status or "未知")
+
+    def _recent_history(
+        self, user_id: str, *, limit: int
+    ) -> tuple[GenerationHistoryRecord, ...]:
+        history_store = getattr(self, "history_store", None)
+        if history_store is None:
+            return ()
+        try:
+            return history_store.recent_for_user(
+                user_id, limit=max(1, min(20, int(limit)))
+            )
+        except Exception:
+            logger.exception("[img_gener] failed to query generation history")
+            return ()
+
+    def _history_lines(
+        self, records: tuple[GenerationHistoryRecord, ...]
+    ) -> list[str]:
+        if not records:
+            return ["• 暂无插件已受理的历史生图记录"]
+        lines: list[str] = []
+        for record in records:
+            created = time.strftime("%m-%d %H:%M:%S", time.localtime(record.created_at))
+            lines.append(
+                f"• #{record.job_id:04d}｜{created}｜"
+                f"{self._history_status_label(record.status)}｜{record.stage}｜"
+                f"{record.size}｜{record.quality or 'auto'}"
+            )
+            if record.result_message:
+                lines.append(f"  结果：{record.result_message[:240]}")
+            if record.prompt:
+                lines.append(f"  提示词：{record.prompt[:240]}")
+        return lines
+
+    async def _history_report(
+        self, event: AstrMessageEvent, *, limit: int = 10
+    ) -> str:
+        user_id, _group_id = self._identity(event)
+        records = self._recent_history(user_id, limit=limit)
+        return "\n".join(["🎨 我的生图历史", *self._history_lines(records)])
+
+    async def _status_report(
+        self,
+        event: AstrMessageEvent,
+        *,
+        include_history: bool,
+        history_limit: int,
+    ) -> str:
+        user_id, group_id = self._identity(event)
+        pool = self._active_job_snapshot(user_id, group_id)
+        records = self._recent_history(user_id, limit=history_limit)
+        lines = ["🎨 生图真实状态", "", "【结论】"]
+        if pool["user"]:
+            lines.append(f"• 你的任务确实在队列或处理中：{pool['user']} 个")
+        elif records:
+            latest = records[0]
+            lines.append(
+                f"• 当前没有你的任务在队列或处理中；最近任务 #{latest.job_id:04d} "
+                f"为“{self._history_status_label(latest.status)}”（{latest.stage}）。"
+            )
+            if latest.result_message:
+                lines.append(f"• 最近结果：{latest.result_message[:240]}")
+        else:
+            lines.append(
+                "• 当前没有你的任务，且插件没有查到已受理记录；"
+                "不能声称正在生成，可能是生图工具没有被实际调用或请求在入队前被拒绝。"
+            )
+
+        lines.extend(
+            [
+                "",
+                "【队列与进度】",
+                f"• 内存任务池：全局 {pool['global']} 个、我的 {pool['user']} 个"
+                + (f"、本群 {pool['group']} 个" if group_id else ""),
+            ]
+        )
+        visible_jobs: list[ActiveGenerationJob] = pool["visible"]
+        if visible_jobs:
+            now = time.monotonic()
+            for job in visible_jobs[:8]:
+                owner = "我的" if job.user_id == user_id else "本群其他用户"
+                elapsed = self._format_duration(now - job.started_at)
+                lines.append(
+                    f"• #{job.job_id:04d}｜{owner}｜{job.source}｜{job.size}｜"
+                    f"{job.stage}｜已用 {elapsed}"
+                )
+        else:
+            lines.append("• 没有可见的等待或处理任务")
+
+        try:
+            status = await self.rate_limiter.status(user_id, group_id)
+            limits = self.rate_limiter.limits
+        except Exception:
+            logger.exception("[img_gener] failed to query rate-limit status")
+            status = None
+            limits = None
+
+        lines.extend(["", "【余量与冷却】"])
+        if status is None or limits is None:
+            lines.append("• SQLite 限流状态查询失败，当前无法可靠给出余量或冷却时间。")
+        else:
+            user_attempts = int(status.get("user_attempts", 0))
+            user_attempts_remaining = int(
+                status.get(
+                    "user_attempts_remaining",
+                    -1
+                    if limits.user_max_attempts <= 0
+                    else max(0, limits.user_max_attempts - user_attempts),
+                )
+            )
+            user_generations = int(status.get("user_generations", 0))
+            user_pending = int(status.get("user_pending", pool["user"]))
+            user_generations_remaining = int(
+                status.get(
+                    "user_generations_remaining",
+                    -1
+                    if limits.user_max_generations <= 0
+                    else max(
+                        0,
+                        limits.user_max_generations
+                        - user_generations
+                        - user_pending,
+                    ),
+                )
+            )
+            lines.extend(
+                [
+                    f"• 我的调用余量：{self._remaining_text(user_attempts_remaining)}"
+                    f"（已用 {self._format_quota(user_attempts, limits.user_max_attempts)}；"
+                    f"{self._format_window(limits.user_attempt_window_seconds)}窗口）",
+                    f"• 我的调用冷却："
+                    f"{self._cooldown_text(int(status.get('user_cooldown_remaining', 0)))}",
+                    f"• 我的生图余量：{self._remaining_text(user_generations_remaining)}"
+                    f"（成功 {user_generations} 次，处理中预留 {user_pending} 次；"
+                    f"{self._format_window(limits.user_generation_window_seconds)}窗口）",
+                ]
+            )
+            user_reset = int(status.get("user_generation_reset_after", 0))
+            attempt_reset = int(status.get("user_attempt_reset_after", 0))
+            if user_generations_remaining == 0 and user_reset > 0:
+                lines.append(
+                    f"• 我的生图窗口最早约 {self._format_duration(user_reset)} 后释放 1 次"
+                )
+            if user_attempts_remaining == 0 and attempt_reset > 0:
+                lines.append(
+                    f"• 我的调用窗口最早约 {self._format_duration(attempt_reset)} 后释放 1 次"
+                )
+
+            if group_id:
+                group_generations = int(status.get("group_generations", 0))
+                group_pending = int(status.get("group_pending", pool["group"]))
+                group_generations_remaining = int(
+                    status.get(
+                        "group_generations_remaining",
+                        -1
+                        if limits.group_max_generations <= 0
+                        else max(
+                            0,
+                            limits.group_max_generations
+                            - group_generations
+                            - group_pending,
+                        ),
+                    )
+                )
+                lines.extend(
+                    [
+                        f"• 本群生图余量：{self._remaining_text(group_generations_remaining)}"
+                        f"（成功 {group_generations} 次，处理中预留 {group_pending} 次；"
+                        f"{self._format_window(limits.group_generation_window_seconds)}窗口）",
+                        f"• 本群调用冷却："
+                        f"{self._cooldown_text(int(status.get('group_cooldown_remaining', 0)))}",
+                    ]
+                )
+                group_reset = int(status.get("group_generation_reset_after", 0))
+                if group_generations_remaining == 0 and group_reset > 0:
+                    lines.append(
+                        f"• 本群生图窗口最早约 {self._format_duration(group_reset)} 后释放 1 次"
+                    )
+
+            lines.append(
+                f"• API 并发预留：{int(status.get('global_inflight', 0))}/"
+                f"{limits.global_max_concurrent}"
+            )
+            admin_check = getattr(event, "is_admin", None)
+            is_admin = False
+            if callable(admin_check):
+                try:
+                    is_admin = bool(admin_check())
+                except Exception:
+                    pass
+            if is_admin and self._bool(
+                "limits", "admins_bypass_limits", default=True
+            ):
+                lines.append("• 当前管理员配置为跳过用户/群配额，但仍受全局并发限制。")
+
+        if include_history:
+            lines.extend(["", "【我的最近记录】", *self._history_lines(records)])
+        return "\n".join(lines)
 
     def _client(self) -> OpenAICompatibleImageClient:
         return OpenAICompatibleImageClient(
@@ -653,12 +987,39 @@ class GPTImageGeneratorPlugin(Star):
                 started_at=started_at,
                 job_id=job_id,
             )
+            job = self._active_jobs.get(job_id)
+            if message and (job is None or not job.finalized):
+                self._finalize_job(
+                    job_id,
+                    status="rejected",
+                    stage="未进入生成",
+                    result_message=message,
+                )
+            elif not message and (job is None or not job.finalized):
+                self._finalize_job(
+                    job_id,
+                    status="succeeded",
+                    stage="已完成",
+                    result_message="图片已生成并发送。",
+                )
             if message:
                 await event.send(event.plain_result(message))
         except asyncio.CancelledError:
+            self._finalize_job(
+                job_id,
+                status="cancelled",
+                stage="任务已取消",
+                result_message="后台任务被取消。",
+            )
             raise
         except Exception as exc:
             logger.exception("[img_gener] background generation failed: %s", exc)
+            self._finalize_job(
+                job_id,
+                status="failed",
+                stage="后台任务异常",
+                result_message="后台生图任务异常终止，请联系管理员查看日志。",
+            )
             try:
                 await event.send(
                     event.plain_result(
@@ -683,7 +1044,13 @@ class GPTImageGeneratorPlugin(Star):
         reference_prompt: str = "",
         source: str,
     ) -> int:
-        job_id, started_at = self._register_job(event, source=source, size=size)
+        job_id, started_at = self._register_job(
+            event,
+            source=source,
+            size=size,
+            prompt=prompt,
+            quality=quality,
+        )
         try:
             task = asyncio.create_task(
                 self._run_background_generation(
@@ -699,6 +1066,12 @@ class GPTImageGeneratorPlugin(Star):
                 name=f"{PLUGIN_NAME}:generate_image",
             )
         except Exception:
+            self._finalize_job(
+                job_id,
+                status="failed",
+                stage="调度失败",
+                result_message="后台任务创建失败。",
+            )
             self._finish_job(job_id)
             raise
         self._background_tasks.add(task)
@@ -992,12 +1365,23 @@ class GPTImageGeneratorPlugin(Star):
             try:
                 await event.send(self._completion_chain(event, caption, output_path))
             except Exception as exc:
+                message = (
+                    "图片已经生成并计入配额，但聊天平台发送失败，"
+                    "请联系管理员查看日志。"
+                )
                 logger.warning(
                     "[img_gener] generated but failed to send image path=%s error=%s",
                     output_path,
                     str(exc)[:500],
                 )
-                return "图片已经生成并计入配额，但聊天平台发送失败，请联系管理员查看日志。"
+                self._finalize_job(
+                    job_id,
+                    status="delivery_failed",
+                    stage="图片发送失败",
+                    result_message=message,
+                    output_filename=output_path.name,
+                )
+                return message
             self._set_job_stage(job_id, "生成评价")
             evaluation = await self._evaluate_image(
                 raw_prompt, generated.content, generated.media_type
@@ -1009,24 +1393,73 @@ class GPTImageGeneratorPlugin(Star):
                     logger.warning(
                         "[img_gener] failed to send evaluation: %s", str(exc)[:500]
                     )
+            self._finalize_job(
+                job_id,
+                status="succeeded",
+                stage="已完成",
+                result_message="图片已生成并发送。",
+                output_filename=output_path.name,
+            )
             return None
         except ImageGeneratorError as exc:
             active_jobs = getattr(self, "_active_jobs", {})
             job = active_jobs.get(job_id) if job_id is not None else None
+            failed_stage = job.stage if job else "未知阶段"
             logger.warning(
                 "[img_gener] generation failed job=%s stage=%s public=%s detail=%s",
                 job_id if job_id is not None else "-",
-                job.stage if job else "unknown",
+                failed_stage,
                 exc.public_message,
                 exc.detail[:1200],
+            )
+            self._finalize_job(
+                job_id,
+                status="failed",
+                stage=f"{failed_stage}失败",
+                result_message=exc.public_message,
             )
             return exc.public_message
         except Exception as exc:
             logger.exception("[img_gener] unexpected generation error: %s", exc)
-            return "生图过程中发生内部错误，请联系管理员查看日志。"
+            message = "生图过程中发生内部错误，请联系管理员查看日志。"
+            active_jobs = getattr(self, "_active_jobs", {})
+            job = active_jobs.get(job_id) if job_id is not None else None
+            self._finalize_job(
+                job_id,
+                status="failed",
+                stage=f"{job.stage if job else '未知阶段'}失败",
+                result_message=message,
+            )
+            return message
         finally:
             if lease_active:
                 await self.rate_limiter.cancel(rate.lease_id)
+
+    @filter.llm_tool(name="get_image_generation_status")
+    async def get_image_generation_status(
+        self,
+        event: AstrMessageEvent,
+        include_history: bool = True,
+        history_limit: int = 5,
+    ) -> str:
+        """Query authoritative image task progress, history, quotas, and cooldowns.
+
+        Always call this tool when the user asks whether an image task is really
+        queued or still generating, why it disappeared, whether the last request
+        failed, recent image-generation history, remaining personal/group quota,
+        or personal/group cooldown. Never infer status from prior conversation.
+        If this tool reports no active task, explicitly tell the user it is not
+        currently generating. This read-only tool does not submit a new image.
+
+        Args:
+            include_history(boolean): Include the current user's recent accepted task records; default true.
+            history_limit(integer): Number of the current user's recent records to return, from 1 to 20; default 5.
+        """  # noqa: E501
+        return await self._status_report(
+            event,
+            include_history=as_bool(include_history, True),
+            history_limit=min(20, as_int(history_limit, 5, minimum=1)),
+        )
 
     @filter.llm_tool(name="generate_image")
     async def generate_image(
@@ -1056,6 +1489,10 @@ class GPTImageGeneratorPlugin(Star):
         wait; do NOT claim the image is finished. The plugin will later send the
         image, the prompt, and a short evaluation as separate messages.
 
+        If the user asks about progress, queue state, failures, history, remaining
+        quota, or cooldown instead of requesting a new image, do not guess and do
+        not call this generation tool. Call get_image_generation_status instead.
+
         Args:
             prompt(string): AI-prepared complete Chinese image prompt; never the raw conversational request.
             size(string): Optional allowed output size; use 816x816 for a small fast square draft.
@@ -1071,17 +1508,42 @@ class GPTImageGeneratorPlugin(Star):
         if not effective_prompt:
             return "请提供需要生成的画面描述。"
         if not self._contains_cjk(effective_prompt):
-            return (
+            message = (
                 "请先将用户需求整理成完整、可直接生图的中文提示词，再调用 "
                 "generate_image；不要传入英文提示词，也不要直接复制用户原话。"
+            )
+            return self._record_rejected_attempt(
+                event,
+                source="LLM",
+                prompt=effective_prompt,
+                size=str(size or DEFAULT_IMAGE_SIZE),
+                quality=quality,
+                stage="中文提示词校验失败",
+                message=message,
             )
         try:
             selected_size = self._normalize_size(size)
         except ImageGeneratorError as exc:
-            return exc.public_message
+            return self._record_rejected_attempt(
+                event,
+                source="LLM",
+                prompt=effective_prompt,
+                size=str(size or DEFAULT_IMAGE_SIZE),
+                quality=quality,
+                stage="参数校验失败",
+                message=exc.public_message,
+            )
         local_rejection = await self._preflight_local_review(event, effective_prompt)
         if local_rejection:
-            return local_rejection
+            return self._record_rejected_attempt(
+                event,
+                source="LLM",
+                prompt=effective_prompt,
+                size=selected_size,
+                quality=quality,
+                stage="入队前审核或限流拒绝",
+                message=local_rejection,
+            )
         self._start_background_generation(
             event,
             effective_prompt,
@@ -1102,7 +1564,16 @@ class GPTImageGeneratorPlugin(Star):
         try:
             selected_size = self._normalize_size(None)
         except ImageGeneratorError as exc:
-            yield event.plain_result(exc.public_message)
+            message = self._record_rejected_attempt(
+                event,
+                source="/生图",
+                prompt=raw_prompt,
+                size=DEFAULT_IMAGE_SIZE,
+                quality=None,
+                stage="参数校验失败",
+                message=exc.public_message,
+            )
+            yield event.plain_result(message)
             return
         if not self._is_allowed(event):
             yield event.plain_result(
@@ -1114,7 +1585,16 @@ class GPTImageGeneratorPlugin(Star):
             return
         local_rejection = await self._preflight_local_review(event, raw_prompt)
         if local_rejection:
-            yield event.plain_result(local_rejection)
+            message = self._record_rejected_attempt(
+                event,
+                source="/生图",
+                prompt=raw_prompt,
+                size=selected_size,
+                quality=None,
+                stage="入队前审核或限流拒绝",
+                message=local_rejection,
+            )
+            yield event.plain_result(message)
             return
         self._start_background_generation(
             event,
@@ -1146,63 +1626,19 @@ class GPTImageGeneratorPlugin(Star):
 
     @filter.command("生图状态", alias={"生图配额"})
     async def status_command(self, event: AstrMessageEvent):
-        """查看队列、当前任务以及用户和群聊配额。"""
+        """查看真实队列、进度、最近结果、余量和冷却。"""
 
         event.stop_event()
-        user_id, group_id = self._identity(event)
-        status = await self.rate_limiter.status(user_id, group_id)
-        pool = self._active_job_snapshot(user_id, group_id)
-        limits = self.rate_limiter.limits
-        lines = [
-            "🎨 生图状态",
-            "",
-            "【队列】",
-            f"• 全局：{pool['global']} 个"
-            f"（并发 {status['global_inflight']}/{limits.global_max_concurrent}）",
-            f"• 我的：{pool['user']} 个",
-        ]
-        if group_id:
-            lines.append(f"• 本群：{pool['group']}/{limits.group_max_concurrent}")
-
-        lines.extend(["", "【任务】"])
-        visible_jobs: list[ActiveGenerationJob] = pool["visible"]
-        if visible_jobs:
-            now = time.monotonic()
-            for job in visible_jobs[:8]:
-                owner = "我的" if job.user_id == user_id else "本群"
-                elapsed = self._format_duration(now - job.started_at)
-                lines.append(
-                    f"• #{job.job_id:04d}｜{owner}｜{job.source}｜{job.size}｜"
-                    f"{job.stage}｜已用 {elapsed}"
-                )
-            if len(visible_jobs) > 8:
-                lines.append(f"• 另有 {len(visible_jobs) - 8} 个任务未展开")
-        else:
-            lines.append("• 暂无等待或处理中的任务")
-
-        user_attempts = self._format_quota(
-            status["user_attempts"], limits.user_max_attempts
+        report = await self._status_report(
+            event,
+            include_history=True,
+            history_limit=3,
         )
-        user_generations = self._format_quota(
-            status["user_generations"], limits.user_max_generations
-        )
-        lines.extend(
-            [
-                "",
-                "【配额】",
-                f"• 我的调用：{user_attempts}"
-                f" · {self._format_window(limits.user_attempt_window_seconds)}窗口",
-                f"• 我的生图：{user_generations}"
-                f" · {self._format_window(limits.user_generation_window_seconds)}窗口",
-            ]
-        )
-        if group_id:
-            group_generations = self._format_quota(
-                status["group_generations"], limits.group_max_generations
-            )
-            lines.append(
-                f"• 本群生图：{group_generations}"
-                f" · {self._format_window(limits.group_generation_window_seconds)}窗口"
-            )
-        yield event.plain_result("\n".join(lines))
+        yield event.plain_result(report)
 
+    @filter.command("生图历史", alias={"生图记录"})
+    async def history_command(self, event: AstrMessageEvent):
+        """查看当前用户最近的持久化生图记录。"""
+
+        event.stop_event()
+        yield event.plain_result(await self._history_report(event, limit=10))

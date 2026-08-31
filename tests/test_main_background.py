@@ -199,7 +199,7 @@ def test_llm_tool_uses_ai_generated_chinese_prompt_and_keeps_reference_text() ->
     asyncio.run(scenario())
 
 
-def test_llm_tool_rejects_non_chinese_generated_prompt() -> None:
+def test_llm_tool_rejects_non_chinese_generated_prompt(tmp_path) -> None:
     async def scenario() -> None:
         _install_astrbot_stubs()
         sys.modules.pop("astrbot_plugin_img_gener.main", None)
@@ -209,9 +209,19 @@ def test_llm_tool_rejects_non_chinese_generated_prompt() -> None:
         plugin._active_jobs = {}
         plugin._next_job_id = 0
         plugin.config = {}
+        plugin.history_store = module.GenerationHistoryStore(tmp_path / "history.sqlite3")
         plugin._is_allowed = lambda event: True
 
         class Event:
+            def get_platform_name(self):
+                return "qq"
+
+            def get_sender_id(self):
+                return "1"
+
+            def get_group_id(self):
+                return None
+
             def get_message_str(self):
                 return "请帮我画一张雨后的车站"
 
@@ -223,8 +233,73 @@ def test_llm_tool_rejects_non_chinese_generated_prompt() -> None:
         assert "中文提示词" in result
         assert plugin._background_tasks == set()
         assert plugin._active_jobs == {}
+        record = plugin.history_store.recent_for_user("qq:1")[0]
+        assert record.status == "rejected"
+        assert record.stage == "中文提示词校验失败"
+        assert "中文提示词" in record.result_message
 
     asyncio.run(scenario())
+
+
+def test_history_create_failure_cannot_overwrite_an_old_record(
+    tmp_path, monkeypatch
+) -> None:
+    _install_astrbot_stubs()
+    sys.modules.pop("astrbot_plugin_img_gener.main", None)
+    module = importlib.import_module("astrbot_plugin_img_gener.main")
+    plugin = object.__new__(module.GPTImageGeneratorPlugin)
+    plugin._active_jobs = {}
+    plugin._next_job_id = 0
+    plugin.history_store = module.GenerationHistoryStore(tmp_path / "history.sqlite3")
+
+    old_job_id = plugin.history_store.create_job(
+        user_id="qq:old",
+        group_id=None,
+        source="LLM",
+        prompt="旧任务",
+        size="816x816",
+        quality="auto",
+    )
+    plugin.history_store.finish_job(
+        old_job_id,
+        status="succeeded",
+        stage="已完成",
+        result_message="旧任务已完成。",
+    )
+
+    def fail_to_create(**kwargs):
+        del kwargs
+        raise OSError("temporary sqlite failure")
+
+    monkeypatch.setattr(plugin.history_store, "create_job", fail_to_create)
+
+    class Event:
+        def get_platform_name(self):
+            return "qq"
+
+        def get_sender_id(self):
+            return "new"
+
+        def get_group_id(self):
+            return None
+
+    fallback_job_id, _ = plugin._register_job(
+        Event(), source="LLM", size="816x816", prompt="新任务"
+    )
+    assert fallback_job_id == old_job_id
+    assert not plugin._active_jobs[fallback_job_id].history_persisted
+
+    plugin._finalize_job(
+        fallback_job_id,
+        status="failed",
+        stage="生成图片失败",
+        result_message="新任务失败。",
+    )
+
+    old_record = plugin.history_store.recent_for_user("qq:old")[0]
+    assert old_record.status == "succeeded"
+    assert old_record.stage == "已完成"
+    assert old_record.result_message == "旧任务已完成。"
 
 
 def test_quoted_reply_images_are_loaded_as_reference_sources(tmp_path) -> None:
@@ -585,7 +660,7 @@ def test_duration_format_is_human_readable() -> None:
     )
 
 
-def test_status_command_lists_active_jobs_with_elapsed_time() -> None:
+def test_status_command_and_agent_tool_list_authoritative_state(tmp_path) -> None:
     async def scenario() -> None:
         _install_astrbot_stubs()
         sys.modules.pop("astrbot_plugin_img_gener.main", None)
@@ -593,6 +668,7 @@ def test_status_command_lists_active_jobs_with_elapsed_time() -> None:
         plugin = object.__new__(module.GPTImageGeneratorPlugin)
         plugin._active_jobs = {}
         plugin._next_job_id = 0
+        plugin.history_store = module.GenerationHistoryStore(tmp_path / "history.sqlite3")
         plugin.config = {
             "api": {
                 "base_url": "https://uuapi.cc/v1",
@@ -626,8 +702,18 @@ def test_status_command_lists_active_jobs_with_elapsed_time() -> None:
                 del user_id, group_id
                 return {
                     "user_attempts": 1,
+                    "user_attempts_remaining": 2,
+                    "user_attempt_reset_after": 0,
+                    "user_cooldown_remaining": 30,
                     "user_generations": 1,
+                    "user_pending": 0,
+                    "user_generations_remaining": 4,
+                    "user_generation_reset_after": 0,
                     "group_generations": 2,
+                    "group_pending": 0,
+                    "group_generations_remaining": 18,
+                    "group_generation_reset_after": 0,
+                    "group_cooldown_remaining": 10,
                     "global_inflight": 1,
                 }
 
@@ -657,17 +743,127 @@ def test_status_command_lists_active_jobs_with_elapsed_time() -> None:
         results = plugin.status_command(event)
         message = await anext(results)
 
-        assert "【队列】" in message
-        assert "全局：1 个" in message
-        assert "【任务】" in message
+        assert "【结论】" in message
+        assert "你的任务确实在队列或处理中：1 个" in message
+        assert "【队列与进度】" in message
+        assert "全局 1 个" in message
         assert "1024x1536" in message
         assert "生成图片" in message
         assert "已用 1 分" in message
-        assert "【配额】" in message
+        assert "【余量与冷却】" in message
+        assert "我的调用余量：2 次" in message
+        assert "我的调用冷却：还需 30.0 秒" in message
+        assert "我的生图余量：4 次" in message
+        assert "本群生图余量：18 次" in message
+        assert "【我的最近记录】" in message
         assert "服务配置" not in message
         assert "密钥" not in message
         assert "审核模型" not in message
         assert "生图接口" not in message
+
+        tool_message = await plugin.get_image_generation_status(
+            event, include_history=True, history_limit=5
+        )
+        assert "你的任务确实在队列或处理中：1 个" in tool_message
+        assert "生成图片" in tool_message
+
+    asyncio.run(scenario())
+
+
+def test_agent_status_reports_no_active_task_and_recent_502_failure(tmp_path) -> None:
+    async def scenario() -> None:
+        _install_astrbot_stubs()
+        sys.modules.pop("astrbot_plugin_img_gener.main", None)
+        module = importlib.import_module("astrbot_plugin_img_gener.main")
+        plugin = object.__new__(module.GPTImageGeneratorPlugin)
+        plugin._active_jobs = {}
+        plugin._next_job_id = 0
+        plugin.config = {}
+        plugin.history_store = module.GenerationHistoryStore(tmp_path / "history.sqlite3")
+        job_id = plugin.history_store.create_job(
+            user_id="qq:1",
+            group_id="qq:100",
+            source="LLM",
+            prompt="雨夜车站",
+            size="816x816",
+            quality="medium",
+            now=100,
+        )
+        plugin.history_store.finish_job(
+            job_id,
+            status="failed",
+            stage="生成图片失败",
+            result_message="生图服务上游暂时异常（HTTP 502），请稍后重试。",
+            now=120,
+        )
+        limits = types.SimpleNamespace(
+            user_max_attempts=3,
+            user_attempt_window_seconds=600,
+            user_max_generations=5,
+            user_generation_window_seconds=3600,
+            group_max_generations=20,
+            group_generation_window_seconds=3600,
+            global_max_concurrent=2,
+            group_max_concurrent=1,
+        )
+
+        class Limiter:
+            def __init__(self):
+                self.limits = limits
+
+            async def status(self, user_id, group_id):
+                del user_id, group_id
+                return {
+                    "user_attempts": 1,
+                    "user_attempts_remaining": 2,
+                    "user_cooldown_remaining": 0,
+                    "user_generations": 0,
+                    "user_pending": 0,
+                    "user_generations_remaining": 5,
+                    "group_generations": 0,
+                    "group_pending": 0,
+                    "group_generations_remaining": 20,
+                    "group_cooldown_remaining": 0,
+                    "global_inflight": 0,
+                }
+
+        plugin.rate_limiter = Limiter()
+
+        class Event:
+            def stop_event(self):
+                pass
+
+            def get_platform_name(self):
+                return "qq"
+
+            def get_sender_id(self):
+                return "1"
+
+            def get_group_id(self):
+                return "100"
+
+            def is_admin(self):
+                return False
+
+            def plain_result(self, message):
+                return message
+
+        event = Event()
+        report = await plugin.get_image_generation_status(
+            event, include_history=True, history_limit=5
+        )
+
+        assert "当前没有你的任务在队列或处理中" in report
+        assert "最近任务 #0001 为“失败”" in report
+        assert "HTTP 502" in report
+        assert "我的生图余量：5 次" in report
+        assert "本群生图余量：20 次" in report
+
+        results = plugin.history_command(event)
+        history = await anext(results)
+        assert "我的生图历史" in history
+        assert "生成图片失败" in history
+        assert "HTTP 502" in history
 
     asyncio.run(scenario())
 

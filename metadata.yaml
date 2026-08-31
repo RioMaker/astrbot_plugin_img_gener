@@ -1,8 +1,8 @@
 name: astrbot_plugin_img_gener
 display_name: GPT Image 2 安全生图
-short_desc: 让 AstrBot 的 LLM 安全、限频地调用 UUAPI GPT Image 2，并携带人物或引用消息参考图。
-desc: 通过 UUAPI 的 OpenAI-compatible Images API 提供经审核、按用户和群限流、支持固定人物及历史引用图片的 LLM 生图工具。
-version: "0.1.15"
+short_desc: 让 AstrBot 的 LLM 安全调用 UUAPI GPT Image 2，并可查询真实进度、历史、余量和冷却。
+desc: 通过 UUAPI 的 OpenAI-compatible Images API 提供经审核、按用户和群限流、支持人物/引用图片，并向 Agent 暴露真实任务状态、个人历史与配额冷却。
+version: "0.1.16"
 author: Rio
 repo: "https://github.com/RioMaker/astrbot_plugin_img_gener"
 astrbot_version: ">=4.13.0"

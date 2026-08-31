@@ -119,6 +119,28 @@ class PersistentRateLimiter:
         return float(row["created_at"])
 
     @staticmethod
+    def _window_reset_after(
+        connection: sqlite3.Connection,
+        scope_type: str,
+        scope_id: str,
+        event_type: str,
+        window_seconds: int,
+        current: float,
+    ) -> int:
+        row = connection.execute(
+            """
+            SELECT MIN(created_at) AS created_at
+            FROM rate_events
+            WHERE scope_type = ? AND scope_id = ? AND event_type = ?
+                AND created_at >= ?
+            """,
+            (scope_type, scope_id, event_type, current - window_seconds),
+        ).fetchone()
+        if not row or row["created_at"] is None:
+            return 0
+        return max(0, math.ceil(float(row["created_at"]) + window_seconds - current))
+
+    @staticmethod
     def _count_reservations(
         connection: sqlite3.Connection, column: str | None = None, value: str = ""
     ) -> int:
@@ -370,32 +392,136 @@ class PersistentRateLimiter:
         current = time.time() if now is None else float(now)
         async with self._lock:
             with self._connect() as connection:
-                return {
-                    "user_attempts": self._count_events(
+                self._cleanup(connection, current)
+                user_attempts = self._count_events(
+                    connection,
+                    "user",
+                    user_id,
+                    "attempt",
+                    current - self.limits.user_attempt_window_seconds,
+                )
+                user_generations = self._count_events(
+                    connection,
+                    "user",
+                    user_id,
+                    "generation",
+                    current - self.limits.user_generation_window_seconds,
+                )
+                group_generations = (
+                    self._count_events(
                         connection,
-                        "user",
-                        user_id,
-                        "attempt",
-                        current - self.limits.user_attempt_window_seconds,
-                    ),
-                    "user_generations": self._count_events(
-                        connection,
-                        "user",
-                        user_id,
+                        "group",
+                        group_id,
                         "generation",
-                        current - self.limits.user_generation_window_seconds,
+                        current - self.limits.group_generation_window_seconds,
+                    )
+                    if group_id
+                    else 0
+                )
+                user_pending = self._count_reservations(
+                    connection, "user_id", user_id
+                )
+                group_pending = (
+                    self._count_reservations(connection, "group_id", group_id)
+                    if group_id
+                    else 0
+                )
+                latest_user = self._latest_event(
+                    connection, "user", user_id, "attempt"
+                )
+                latest_group = (
+                    self._latest_event(connection, "group", group_id, "attempt")
+                    if group_id
+                    else None
+                )
+                user_cooldown_remaining = (
+                    max(
+                        0,
+                        math.ceil(
+                            latest_user
+                            + self.limits.user_cooldown_seconds
+                            - current
+                        ),
+                    )
+                    if latest_user is not None
+                    else 0
+                )
+                group_cooldown_remaining = (
+                    max(
+                        0,
+                        math.ceil(
+                            latest_group
+                            + self.limits.group_cooldown_seconds
+                            - current
+                        ),
+                    )
+                    if latest_group is not None
+                    else 0
+                )
+
+                def remaining(maximum: int, used: int) -> int:
+                    return -1 if maximum <= 0 else max(0, maximum - used)
+
+                return {
+                    "user_attempts": user_attempts,
+                    "user_attempts_remaining": remaining(
+                        self.limits.user_max_attempts, user_attempts
                     ),
-                    "group_generations": (
-                        self._count_events(
+                    "user_attempt_reset_after": (
+                        self._window_reset_after(
+                            connection,
+                            "user",
+                            user_id,
+                            "attempt",
+                            self.limits.user_attempt_window_seconds,
+                            current,
+                        )
+                        if self.limits.user_max_attempts > 0
+                        and user_attempts >= self.limits.user_max_attempts
+                        else 0
+                    ),
+                    "user_generations": user_generations,
+                    "user_pending": user_pending,
+                    "user_generations_remaining": remaining(
+                        self.limits.user_max_generations,
+                        user_generations + user_pending,
+                    ),
+                    "user_generation_reset_after": (
+                        self._window_reset_after(
+                            connection,
+                            "user",
+                            user_id,
+                            "generation",
+                            self.limits.user_generation_window_seconds,
+                            current,
+                        )
+                        if self.limits.user_max_generations > 0
+                        and user_generations >= self.limits.user_max_generations
+                        else 0
+                    ),
+                    "user_cooldown_remaining": user_cooldown_remaining,
+                    "group_generations": group_generations,
+                    "group_pending": group_pending,
+                    "group_generations_remaining": remaining(
+                        self.limits.group_max_generations,
+                        group_generations + group_pending,
+                    ),
+                    "group_generation_reset_after": (
+                        self._window_reset_after(
                             connection,
                             "group",
                             group_id,
                             "generation",
-                            current - self.limits.group_generation_window_seconds,
+                            self.limits.group_generation_window_seconds,
+                            current,
                         )
                         if group_id
+                        and self.limits.group_max_generations > 0
+                        and group_generations >= self.limits.group_max_generations
                         else 0
                     ),
+                    "group_cooldown_remaining": group_cooldown_remaining,
+                    "group_inflight": group_pending,
                     "global_inflight": self._count_reservations(connection),
                 }
 
