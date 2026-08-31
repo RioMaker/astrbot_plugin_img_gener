@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,13 +26,15 @@ try:
         normalize_base_url,
         resolve_secret,
     )
-    from .contact_sheet import build_contact_sheet_from_sources
+    from .contact_sheet import build_contact_sheet_from_sources, build_gallery_grid
     from .errors import ConfigurationError, ImageGeneratorError
+    from .gallery import GalleryImage, GalleryStore
     from .generation_history import GenerationHistoryRecord, GenerationHistoryStore
     from .image_client import OpenAICompatibleImageClient
     from .moderation import PromptModerator
     from .rate_limiter import LimitConfig, PersistentRateLimiter
     from .storage import OutputStore
+    from .user_profiles import UserProfile, UserProfileStore
 except ImportError:  # pragma: no cover - direct script-style import fallback.
     from character_references import CharacterReferenceManager, ResolvedReferences
     from config import (
@@ -43,13 +46,15 @@ except ImportError:  # pragma: no cover - direct script-style import fallback.
         normalize_base_url,
         resolve_secret,
     )
-    from contact_sheet import build_contact_sheet_from_sources
+    from contact_sheet import build_contact_sheet_from_sources, build_gallery_grid
     from errors import ConfigurationError, ImageGeneratorError
+    from gallery import GalleryImage, GalleryStore
     from generation_history import GenerationHistoryRecord, GenerationHistoryStore
     from image_client import OpenAICompatibleImageClient
     from moderation import PromptModerator
     from rate_limiter import LimitConfig, PersistentRateLimiter
     from storage import OutputStore
+    from user_profiles import UserProfile, UserProfileStore
 
 
 PLUGIN_NAME = "astrbot_plugin_img_gener"
@@ -135,6 +140,10 @@ class GPTImageGeneratorPlugin(Star):
             self.data_dir / "generation_history.sqlite3"
         )
         self._recovered_history_jobs = self.history_store.recover_unfinished()
+        self.gallery_store = GalleryStore(self.data_dir / "gallery")
+        self.user_profiles = UserProfileStore(
+            self.data_dir / "user_profiles.sqlite3"
+        )
         self.references = CharacterReferenceManager(
             self._get("references", "characters", default=[]),
             data_dir=self.data_dir,
@@ -186,6 +195,10 @@ class GPTImageGeneratorPlugin(Star):
             removed,
             history_removed,
             self._recovered_history_jobs,
+        )
+        logger.info(
+            "[img_gener] permanent gallery images=%s",
+            self.gallery_store.count(),
         )
 
     async def terminate(self) -> None:
@@ -637,6 +650,15 @@ class GPTImageGeneratorPlugin(Star):
             ):
                 lines.append("• 当前管理员配置为跳过用户/群配额，但仍受全局并发限制。")
 
+        gallery_store = getattr(self, "gallery_store", None)
+        if gallery_store is not None:
+            try:
+                lines.extend(
+                    ["", "【长期图库】", f"• 已永久归档 {gallery_store.count()} 张成功图片"]
+                )
+            except Exception:
+                logger.exception("[img_gener] failed to count gallery images")
+                lines.extend(["", "【长期图库】", "• 图库计数暂时不可用"])
         if include_history:
             lines.extend(["", "【我的最近记录】", *self._history_lines(records)])
         return "\n".join(lines)
@@ -697,6 +719,270 @@ class GPTImageGeneratorPlugin(Star):
         raw_group = event.get_group_id()
         group_id = f"{platform}:{raw_group}" if raw_group else None
         return user_id, group_id
+
+    @staticmethod
+    def _raw_get(value: Any, key: str, default: Any = None) -> Any:
+        if isinstance(value, dict):
+            return value.get(key, default)
+        return getattr(value, key, default)
+
+    def _mentioned_qqs(self, event: AstrMessageEvent) -> tuple[str, ...]:
+        """Extract real At targets while excluding the bot itself and @all."""
+
+        values: list[str] = []
+        getter = getattr(event, "get_messages", None)
+        try:
+            chain = getter() if callable(getter) else event.message_obj.message
+        except Exception:
+            chain = ()
+        at_cls = getattr(Comp, "At", None)
+        for segment in chain or ():
+            is_at = bool(at_cls is not None and isinstance(segment, at_cls))
+            is_at = is_at or type(segment).__name__.casefold() == "at"
+            if not is_at:
+                continue
+            raw = next(
+                (
+                    self._raw_get(segment, key)
+                    for key in ("qq", "user_id", "target")
+                    if self._raw_get(segment, key) is not None
+                ),
+                "",
+            )
+            value = UserProfileStore.normalize_qq(str(raw))
+            if value and value.casefold() != "all":
+                values.append(value)
+
+        raw_message = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        raw_chain = self._raw_get(raw_message, "message", ())
+        if isinstance(raw_chain, list):
+            for segment in raw_chain:
+                if str(self._raw_get(segment, "type", "")).casefold() != "at":
+                    continue
+                data = self._raw_get(segment, "data", {})
+                value = UserProfileStore.normalize_qq(
+                    str(self._raw_get(data, "qq", ""))
+                )
+                if value and value.casefold() != "all":
+                    values.append(value)
+
+        self_ids: set[str] = set()
+        self_getter = getattr(event, "get_self_id", None)
+        if callable(self_getter):
+            try:
+                self_ids.add(str(self_getter() or ""))
+            except Exception:
+                pass
+        for source in (
+            getattr(event, "message_obj", None),
+            raw_message,
+            getattr(event, "bot", None),
+        ):
+            self_ids.add(str(self._raw_get(source, "self_id", "") or ""))
+        self_ids.discard("")
+        return tuple(
+            value for value in dict.fromkeys(values) if value not in self_ids
+        )
+
+    async def _group_member_name(
+        self, event: AstrMessageEvent, qq: str
+    ) -> str:
+        """Read a current group card/nickname and cap it to the alias limit."""
+
+        sender_qq = UserProfileStore.normalize_qq(str(event.get_sender_id() or ""))
+        if qq == sender_qq:
+            getter = getattr(event, "get_sender_name", None)
+            if callable(getter):
+                try:
+                    name = UserProfileStore.normalize_alias(str(getter() or ""))
+                    if name:
+                        return name
+                except Exception:
+                    pass
+        group_id = str(event.get_group_id() or "").strip()
+        client = getattr(event, "bot", None)
+        call_action = getattr(client, "call_action", None)
+        if group_id and callable(call_action):
+            try:
+                result = await call_action(
+                    action="get_group_member_info",
+                    group_id=int(group_id) if group_id.isdigit() else group_id,
+                    user_id=int(qq) if qq.isdigit() else qq,
+                    no_cache=True,
+                )
+                data = self._raw_get(result, "data") or result
+                name = UserProfileStore.normalize_alias(
+                    str(
+                        self._raw_get(data, "card")
+                        or self._raw_get(data, "nickname")
+                        or ""
+                    )
+                )
+                if name:
+                    return name
+            except Exception as exc:
+                logger.warning(
+                    "[img_gener] failed to query group member name qq=%s error=%s",
+                    qq,
+                    str(exc)[:300],
+                )
+        profile_store = getattr(self, "user_profiles", None)
+        if profile_store is not None:
+            profile = profile_store.get(qq)
+            if profile is not None and profile.display_name:
+                return profile.display_name
+        return qq
+
+    @staticmethod
+    def _self_portrait_requested(text: str) -> bool:
+        compact = " ".join(str(text or "").split())
+        patterns = (
+            r"(?:画|绘制|生成|制作|做).{0,8}(?:我本人|我的画像|我的肖像|我的形象)",
+            r"(?:画|绘制|生成)(?:一下|一张)?我(?:在|穿|站|坐|作为|成为|，|,|$)",
+            r"(?:我的|本人)(?:画像|头像|肖像|形象|照片|立绘)",
+            r"(?:以我|把我).{0,8}(?:主角|人物|画面|画进去)",
+        )
+        return any(re.search(pattern, compact) for pattern in patterns)
+
+    async def _portrait_ambiguity_message(
+        self,
+        event: AstrMessageEvent,
+        alias: str,
+        candidates: tuple[UserProfile, ...],
+    ) -> str:
+        lines = [
+            f"别名“{alias}”对应多个用户，当前没有受理生图任务。",
+            "请先让用户用数字序号确认人物：",
+        ]
+        group_id = str(event.get_group_id() or "") or None
+        for index, profile in enumerate(candidates, start=1):
+            display_name = await self._group_member_name(event, profile.qq)
+            try:
+                self.user_profiles.ensure_profile(
+                    profile.qq,
+                    display_name=display_name,
+                    group_id=group_id,
+                )
+            except Exception:
+                logger.exception(
+                    "[img_gener] failed to refresh ambiguous profile qq=%s",
+                    profile.qq,
+                )
+            lines.append(f"{index}.（{profile.qq}）（{display_name}）")
+        lines.append(
+            "确认后再次调用 generate_image，并把对应 QQ 号放入 "
+            "portrait_user_qqs；不要根据重名别名自行猜测。"
+        )
+        return "\n".join(lines)
+
+    async def _resolve_portrait_subjects(
+        self,
+        event: AstrMessageEvent,
+        text: str,
+        requested: list[str] | None,
+    ) -> tuple[tuple[str, ...], str | None]:
+        profile_store = getattr(self, "user_profiles", None)
+        if profile_store is None:
+            return (), None
+        sender_qq = profile_store.normalize_qq(str(event.get_sender_id() or ""))
+        subjects: list[str] = []
+        for raw in requested or ():
+            token = str(raw or "").strip()
+            if token.casefold() in {"self", "me"} or token in {"自己", "本人", "我"}:
+                if sender_qq:
+                    subjects.append(sender_qq)
+                continue
+            match = re.fullmatch(r"(?:qq:)?(\d{5,20})", token, re.I)
+            if match:
+                subjects.append(match.group(1))
+                continue
+            candidates = profile_store.alias_candidates(token)
+            if len(candidates) > 1:
+                return (), await self._portrait_ambiguity_message(
+                    event, profile_store.normalize_alias(token), candidates
+                )
+            if len(candidates) == 1:
+                subjects.append(candidates[0].qq)
+                continue
+            return (), f"没有找到用户画像别名“{token}”，请让用户使用 @ 或 QQ 号指定。"
+
+        subjects.extend(self._mentioned_qqs(event))
+        if not subjects and sender_qq and self._self_portrait_requested(text):
+            subjects.append(sender_qq)
+
+        if not subjects:
+            for alias_match in profile_store.match_aliases(text):
+                if len(alias_match.candidates) > 1:
+                    return (), await self._portrait_ambiguity_message(
+                        event, alias_match.alias, alias_match.candidates
+                    )
+                subjects.append(alias_match.candidates[0].qq)
+
+        resolved = tuple(dict.fromkeys(profile_store.normalize_qq(item) for item in subjects))
+        group_id = str(event.get_group_id() or "") or None
+        try:
+            for qq in resolved:
+                display_name = await self._group_member_name(event, qq)
+                profile_store.ensure_profile(
+                    qq,
+                    display_name=display_name,
+                    group_id=group_id,
+                )
+        except Exception:
+            logger.exception("[img_gener] failed to prepare user portrait profiles")
+            return (), "用户画像档案暂时不可用，当前没有受理生图任务。"
+        return resolved, None
+
+    async def _archive_generated_image(
+        self,
+        event: AstrMessageEvent,
+        generated: Any,
+        *,
+        prompt: str,
+        size: str,
+        quality: str,
+        duration_seconds: float,
+        job_id: int | None,
+        portrait_user_qqs: tuple[str, ...],
+    ) -> tuple[GalleryImage | None, tuple[str, ...]]:
+        gallery_store = getattr(self, "gallery_store", None)
+        if gallery_store is None:
+            return None, portrait_user_qqs
+        requester_qq = UserProfileStore.normalize_qq(
+            str(event.get_sender_id() or "")
+        )
+        requester_name = await self._group_member_name(event, requester_qq)
+        record = gallery_store.add_image(
+            generated.content,
+            extension=generated.extension,
+            media_type=generated.media_type,
+            requester_qq=requester_qq,
+            requester_name=requester_name,
+            group_id=str(event.get_group_id() or "") or None,
+            prompt=prompt,
+            size=size,
+            quality=quality,
+            duration_seconds=duration_seconds,
+            job_id=job_id,
+        )
+        profile_store = getattr(self, "user_profiles", None)
+        profile_failures: list[str] = []
+        if profile_store is not None:
+            for qq in portrait_user_qqs:
+                try:
+                    profile_store.add_reference(
+                        qq,
+                        gallery_id=record.image_id,
+                        image_path=record.image_path,
+                    )
+                except Exception:
+                    profile_failures.append(qq)
+                    logger.exception(
+                        "[img_gener] failed to update portrait profile qq=%s gallery=%s",
+                        qq,
+                        record.image_id,
+                    )
+        return record, tuple(profile_failures)
 
     @staticmethod
     def _event_message_text(event: AstrMessageEvent) -> str:
@@ -972,6 +1258,7 @@ class GPTImageGeneratorPlugin(Star):
         size: str,
         quality: str | None,
         characters: list[str] | None,
+        portrait_user_qqs: tuple[str, ...] = (),
         reference_prompt: str = "",
         job_id: int,
         started_at: float,
@@ -983,6 +1270,7 @@ class GPTImageGeneratorPlugin(Star):
                 size=size,
                 quality=quality,
                 characters=characters,
+                portrait_user_qqs=portrait_user_qqs,
                 reference_prompt=reference_prompt,
                 started_at=started_at,
                 job_id=job_id,
@@ -1041,6 +1329,7 @@ class GPTImageGeneratorPlugin(Star):
         size: str,
         quality: str | None,
         characters: list[str] | None,
+        portrait_user_qqs: tuple[str, ...] = (),
         reference_prompt: str = "",
         source: str,
     ) -> int:
@@ -1059,6 +1348,7 @@ class GPTImageGeneratorPlugin(Star):
                     size=size,
                     quality=quality,
                     characters=characters,
+                    portrait_user_qqs=portrait_user_qqs,
                     reference_prompt=reference_prompt,
                     job_id=job_id,
                     started_at=started_at,
@@ -1160,6 +1450,7 @@ class GPTImageGeneratorPlugin(Star):
         size: str | None = None,
         quality: str | None = None,
         characters: list[str] | None = None,
+        portrait_user_qqs: tuple[str, ...] = (),
         reference_prompt: str = "",
         started_at: float | None = None,
         job_id: int | None = None,
@@ -1187,25 +1478,38 @@ class GPTImageGeneratorPlugin(Star):
                 f"单次最多使用 {max_quoted_images} 张引用消息图片，"
                 "请减少引用图片数量后重试。"
             )
-        total_reference_limit = self.references.max_total_images
+        profile_store = getattr(self, "user_profiles", None)
+        profile_references = (
+            profile_store.character_references(portrait_user_qqs)
+            if profile_store is not None and portrait_user_qqs
+            else ()
+        )
+        reference_manager = self.references.with_characters(profile_references)
+        total_reference_limit = reference_manager.max_total_images
         if len(quoted_components) > total_reference_limit:
             return (
                 f"引用消息中有 {len(quoted_components)} 张图片，超过单次参考图上限 "
                 f"{total_reference_limit} 张。"
             )
-        resolved = self.references.resolve(
+        requested_characters = [*list(characters or ()), *portrait_user_qqs]
+        resolved = reference_manager.resolve(
             "\n".join(item for item in (reference_prompt, raw_prompt) if item),
-            characters,
+            requested_characters or None,
             max_total_images=total_reference_limit - len(quoted_components),
         )
         if resolved.unknown_requested_names and self._bool(
             "references", "strict_references", default=True
         ):
             return "未配置这些人物参考：" + "、".join(resolved.unknown_requested_names)
-        if resolved.missing_characters and self._bool(
+        strict_missing = tuple(
+            name
+            for name in resolved.missing_characters
+            if name not in set(portrait_user_qqs)
+        )
+        if strict_missing and self._bool(
             "references", "strict_references", default=True
         ):
-            return "人物参考图缺失或不可用：" + "、".join(resolved.missing_characters)
+            return "人物参考图缺失或不可用：" + "、".join(strict_missing)
         if resolved.capped_characters and self._bool(
             "references", "strict_references", default=True
         ):
@@ -1348,6 +1652,28 @@ class GPTImageGeneratorPlugin(Star):
             await self.rate_limiter.complete(rate.lease_id)
             lease_active = False
             output_path = self.output_store.save(generated)
+            duration_seconds = time.monotonic() - started_at
+            self._set_job_stage(job_id, "归档长期图库")
+            gallery_record: GalleryImage | None = None
+            profile_failures: tuple[str, ...] = ()
+            archive_failed = False
+            try:
+                gallery_record, profile_failures = await self._archive_generated_image(
+                    event,
+                    generated,
+                    prompt=raw_prompt,
+                    size=selected_size,
+                    quality=selected_quality,
+                    duration_seconds=duration_seconds,
+                    job_id=job_id,
+                    portrait_user_qqs=portrait_user_qqs,
+                )
+            except Exception:
+                archive_failed = True
+                logger.exception(
+                    "[img_gener] failed to archive generated image job=%s", job_id
+                )
+
             self._set_job_stage(job_id, "发送图片")
             reference_parts = []
             if resolved.names:
@@ -1357,16 +1683,39 @@ class GPTImageGeneratorPlugin(Star):
             reference_text = (
                 "；已携带" + "；".join(reference_parts) if reference_parts else ""
             )
-            duration = self._format_duration(time.monotonic() - started_at)
+            archive_parts = []
+            if gallery_record is not None:
+                archive_parts.append(f"图库编号：{gallery_record.image_id}")
+                updated_profiles = tuple(
+                    qq for qq in portrait_user_qqs if qq not in set(profile_failures)
+                )
+                if updated_profiles:
+                    archive_parts.append(
+                        "已更新用户画像：" + "、".join(updated_profiles)
+                    )
+                if profile_failures:
+                    archive_parts.append(
+                        "画像档案更新失败：" + "、".join(profile_failures)
+                    )
+            elif archive_failed:
+                archive_parts.append("图库归档失败，请联系管理员")
+            archive_text = "；" + "；".join(archive_parts) if archive_parts else ""
+            duration = self._format_duration(duration_seconds)
             caption = (
                 f" 图片已生成（{selected_size}，{selected_quality}）"
-                f"{reference_text}。总用时：{duration}。\n提示词：{raw_prompt}"
+                f"{reference_text}{archive_text}。总用时：{duration}。\n"
+                f"提示词：{raw_prompt}"
             )
             try:
                 await event.send(self._completion_chain(event, caption, output_path))
             except Exception as exc:
+                gallery_hint = (
+                    f"，已归档为图库编号 {gallery_record.image_id}"
+                    if gallery_record is not None
+                    else ""
+                )
                 message = (
-                    "图片已经生成并计入配额，但聊天平台发送失败，"
+                    f"图片已经生成并计入配额{gallery_hint}，但聊天平台发送失败，"
                     "请联系管理员查看日志。"
                 )
                 logger.warning(
@@ -1397,7 +1746,14 @@ class GPTImageGeneratorPlugin(Star):
                 job_id,
                 status="succeeded",
                 stage="已完成",
-                result_message="图片已生成并发送。",
+                result_message=(
+                    "图片已生成并发送。"
+                    + (
+                        f" 图库编号：{gallery_record.image_id}。"
+                        if gallery_record is not None
+                        else " 图库归档失败。" if archive_failed else ""
+                    )
+                ),
                 output_filename=output_path.name,
             )
             return None
@@ -1469,6 +1825,7 @@ class GPTImageGeneratorPlugin(Star):
         size: str | None = None,
         quality: str | None = None,
         characters: list[str] | None = None,
+        portrait_user_qqs: list[str] | None = None,
     ) -> str:
         """Submit one image generation request to GPT Image 2 and return immediately.
 
@@ -1483,11 +1840,21 @@ class GPTImageGeneratorPlugin(Star):
         Images contained in a quoted/replied historical message are also attached
         automatically; describe how those images should guide the result in prompt.
 
+        For a portrait of the requester, pass "self" in portrait_user_qqs. For a
+        user explicitly mentioned with @, pass that QQ number; the plugin also reads
+        At components directly. Existing QQ portrait profiles use up to three recent
+        successful images as references. If an alias belongs to multiple QQ users,
+        do not guess: return the numbered QQ/name candidates to the user, ask them
+        to reply with a number, then call this tool again with the confirmed QQ.
+
         IMPORTANT: generation runs in the BACKGROUND and typically takes about 3
         minutes. When this tool returns, the image is NOT ready yet — the request
         has only been accepted. Tell the user it is generating and ask them to
         wait; do NOT claim the image is finished. The plugin will later send the
         image, the prompt, and a short evaluation as separate messages.
+        This instruction applies only when the tool explicitly returns an accepted
+        request with queue information. If it returns rejection, no active task,
+        or numbered identity candidates, relay that result and do NOT say generating.
 
         If the user asks about progress, queue state, failures, history, remaining
         quota, or cooldown instead of requesting a new image, do not guess and do
@@ -1498,6 +1865,8 @@ class GPTImageGeneratorPlugin(Star):
             size(string): Optional allowed output size; use 816x816 for a small fast square draft.
             quality(string): Optional quality: auto, low, medium, or high.
             characters(array): Optional configured character names; omit to auto-detect names and aliases from prompt.
+            portrait_user_qqs(array): QQ portrait subjects; use ["self"] for the
+                requester or explicit QQ numbers after @/alias confirmation.
         """  # noqa: E501
         if not self._is_allowed(event):
             return "生图功能未启用，或当前用户/群没有使用权限。"
@@ -1533,6 +1902,21 @@ class GPTImageGeneratorPlugin(Star):
                 stage="参数校验失败",
                 message=exc.public_message,
             )
+        portrait_subjects, portrait_error = await self._resolve_portrait_subjects(
+            event,
+            "\n".join(item for item in (reference_prompt, effective_prompt) if item),
+            portrait_user_qqs,
+        )
+        if portrait_error:
+            return self._record_rejected_attempt(
+                event,
+                source="LLM",
+                prompt=effective_prompt,
+                size=selected_size,
+                quality=quality,
+                stage="人物身份待确认",
+                message=portrait_error,
+            )
         local_rejection = await self._preflight_local_review(event, effective_prompt)
         if local_rejection:
             return self._record_rejected_attempt(
@@ -1550,6 +1934,7 @@ class GPTImageGeneratorPlugin(Star):
             size=selected_size,
             quality=quality,
             characters=characters,
+            portrait_user_qqs=portrait_subjects,
             reference_prompt=reference_prompt,
             source="LLM",
         )
@@ -1583,6 +1968,21 @@ class GPTImageGeneratorPlugin(Star):
         if not raw_prompt:
             yield event.plain_result("请提供需要生成的画面描述。")
             return
+        portrait_subjects, portrait_error = await self._resolve_portrait_subjects(
+            event, raw_prompt, None
+        )
+        if portrait_error:
+            message = self._record_rejected_attempt(
+                event,
+                source="/生图",
+                prompt=raw_prompt,
+                size=selected_size,
+                quality=None,
+                stage="人物身份待确认",
+                message=portrait_error,
+            )
+            yield event.plain_result(message)
+            return
         local_rejection = await self._preflight_local_review(event, raw_prompt)
         if local_rejection:
             message = self._record_rejected_attempt(
@@ -1602,6 +2002,7 @@ class GPTImageGeneratorPlugin(Star):
             size=selected_size,
             quality=None,
             characters=None,
+            portrait_user_qqs=portrait_subjects,
             source="/生图",
         )
         yield event.plain_result(await self._start_notice(event, selected_size))
@@ -1637,8 +2038,111 @@ class GPTImageGeneratorPlugin(Star):
         yield event.plain_result(report)
 
     @filter.command("生图历史", alias={"生图记录"})
-    async def history_command(self, event: AstrMessageEvent):
-        """查看当前用户最近的持久化生图记录。"""
+    async def history_command(self, event: AstrMessageEvent, query: GreedyStr):
+        """查看永久图库总量、指定编号详情，或随机图片拼图。"""
 
         event.stop_event()
-        yield event.plain_result(await self._history_report(event, limit=10))
+        gallery_store = getattr(self, "gallery_store", None)
+        if gallery_store is None:
+            yield event.plain_result("长期图库尚未初始化。")
+            return
+        tail = str(query or "").strip()
+        if not tail:
+            try:
+                total = gallery_store.count()
+            except Exception:
+                logger.exception("[img_gener] failed to count gallery")
+                yield event.plain_result("长期图库暂时不可用，请联系管理员查看日志。")
+                return
+            yield event.plain_result(
+                "🎨 永久生图图库\n"
+                f"当前共保存 {total} 张成功图片。\n"
+                "图片编号按成功归档顺序自增：1、2、3……\n"
+                "查看详情：/生图历史 <图片编号>\n"
+                "随机单图：/生图历史 随机\n"
+                "随机拼图：/生图历史 随机 <数量>（2～9）"
+            )
+            return
+
+        parts = tail.split()
+        if parts[0].casefold() in {"随机", "random"}:
+            if len(parts) > 2:
+                yield event.plain_result("用法：/生图历史 随机 [1～9]")
+                return
+            try:
+                requested_count = int(parts[1]) if len(parts) == 2 else 1
+            except ValueError:
+                yield event.plain_result("随机图片数量必须是 1～9 的整数。")
+                return
+            if not 1 <= requested_count <= 9:
+                yield event.plain_result("随机图片数量必须在 1～9 之间。")
+                return
+            try:
+                records = tuple(
+                    record
+                    for record in gallery_store.random(requested_count)
+                    if record.image_path.is_file()
+                )
+            except Exception:
+                logger.exception("[img_gener] failed to query random gallery images")
+                yield event.plain_result("随机读取图库失败，请联系管理员查看日志。")
+                return
+            if not records:
+                yield event.plain_result("图库中还没有可读取的成功图片。")
+                return
+            if requested_count == 1:
+                yield event.chain_result(
+                    [Comp.Image.fromFileSystem(str(records[0].image_path))]
+                )
+                return
+            try:
+                grid = await asyncio.to_thread(
+                    build_gallery_grid,
+                    tuple(record.image_path for record in records),
+                )
+                grid_path = self.output_store.save_bytes(grid.content, ".png")
+            except ImageGeneratorError as exc:
+                yield event.plain_result(exc.public_message)
+                return
+            except Exception:
+                logger.exception("[img_gener] failed to build random gallery grid")
+                yield event.plain_result("随机图库拼图保存失败，请联系管理员查看日志。")
+                return
+            yield event.chain_result([Comp.Image.fromFileSystem(str(grid_path))])
+            return
+
+        if len(parts) != 1 or not parts[0].isdigit():
+            yield event.plain_result(
+                "用法：/生图历史、/生图历史 <图片编号>、"
+                "/生图历史 随机 [1～9]"
+            )
+            return
+        try:
+            record = gallery_store.get(int(parts[0]))
+        except Exception:
+            logger.exception("[img_gener] failed to query gallery image")
+            yield event.plain_result("查询图库失败，请联系管理员查看日志。")
+            return
+        if record is None:
+            yield event.plain_result(f"图库中不存在编号 {parts[0]}。")
+            return
+        if not record.image_path.is_file():
+            yield event.plain_result(
+                f"图库编号 {record.image_id} 的图片文件缺失，请联系管理员检查长期存储。"
+            )
+            return
+        created = time.strftime(
+            "%Y-%m-%d %H:%M:%S", time.localtime(record.created_at)
+        )
+        requester = record.requester_name or "未知昵称"
+        group_text = record.group_id or "私聊"
+        details = (
+            f" 图库编号：{record.image_id}\n"
+            f"请求人：{requester}（QQ：{record.requester_qq}）\n"
+            f"会话：{group_text}\n"
+            f"时间：{created}\n"
+            f"用时：{self._format_duration(record.duration_seconds)}\n"
+            f"规格：{record.size}，{record.quality}\n"
+            f"提示词：{record.prompt}"
+        )
+        yield self._completion_chain(event, details, record.image_path)

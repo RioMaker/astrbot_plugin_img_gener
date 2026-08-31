@@ -19,12 +19,53 @@ MAX_SHEET_CELLS = 12
 SHEET_CELL_SIZE = 1024
 SHEET_COLUMNS = 2
 SHEET_LABEL_HEIGHT = 72
+MAX_GALLERY_GRID_CELLS = 9
+GALLERY_GRID_CELL_SIZE = 768
 
 
 @dataclass(frozen=True, slots=True)
 class ContactSheet:
     content: bytes
     media_type: str = "image/png"
+
+
+def build_gallery_grid(image_paths: tuple[Path, ...]) -> ContactSheet:
+    """Build an unlabeled adaptive 1-9 image grid for random gallery results."""
+
+    if Image is None or ImageOps is None:
+        raise ImageGeneratorError(
+            "随机图库拼图需要 Pillow 依赖；请确认插件依赖已完整安装。"
+        )
+    selected = image_paths[:MAX_GALLERY_GRID_CELLS]
+    if not selected:
+        raise ImageGeneratorError("图库中没有可用于拼图的图片。")
+    count = len(selected)
+    columns = count if count <= 3 else (2 if count == 4 else 3)
+    rows = (count + columns - 1) // columns
+    canvas = Image.new(
+        "RGB",
+        (columns * GALLERY_GRID_CELL_SIZE, rows * GALLERY_GRID_CELL_SIZE),
+        (24, 24, 24),
+    )
+    for index, path in enumerate(selected):
+        try:
+            with Image.open(path) as source:
+                fitted = ImageOps.fit(
+                    source.convert("RGB"),
+                    (GALLERY_GRID_CELL_SIZE, GALLERY_GRID_CELL_SIZE),
+                    method=Image.Resampling.LANCZOS,
+                )
+        except (OSError, ValueError) as exc:
+            raise ImageGeneratorError(
+                "图库中有图片无法读取，请联系管理员检查长期存储。",
+                detail=f"gallery_grid path={path} error={type(exc).__name__}: {exc}",
+            ) from exc
+        x = (index % columns) * GALLERY_GRID_CELL_SIZE
+        y = (index // columns) * GALLERY_GRID_CELL_SIZE
+        canvas.paste(fitted, (x, y))
+    output = io.BytesIO()
+    canvas.save(output, format="PNG", optimize=True)
+    return ContactSheet(content=output.getvalue())
 
 
 def _sheet_label_font():

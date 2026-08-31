@@ -35,8 +35,20 @@ def _install_astrbot_stubs() -> None:
         def __init__(self, path: str):
             self.path = path
 
+        @classmethod
+        def fromFileSystem(cls, path: str):
+            return cls(path)
+
         async def convert_to_file_path(self):
             return self.path
+
+    class _At:
+        def __init__(self, qq: str):
+            self.qq = str(qq)
+
+    class _Plain:
+        def __init__(self, text: str):
+            self.text = text
 
     class _Reply:
         def __init__(self, chain=None):
@@ -49,6 +61,8 @@ def _install_astrbot_stubs() -> None:
 
     components.Image = _Image
     components.Reply = _Reply
+    components.At = _At
+    components.Plain = _Plain
     api.AstrBotConfig = dict
     api.logger = _Logger()
     event_module.AstrMessageEvent = object
@@ -859,14 +873,283 @@ def test_agent_status_reports_no_active_task_and_recent_502_failure(tmp_path) ->
         assert "我的生图余量：5 次" in report
         assert "本群生图余量：20 次" in report
 
-        results = plugin.history_command(event)
-        history = await anext(results)
-        assert "我的生图历史" in history
-        assert "生成图片失败" in history
-        assert "HTTP 502" in history
 
     asyncio.run(scenario())
 
+
+def test_first_qq_portrait_without_reference_uses_description_and_is_archived(
+    tmp_path,
+) -> None:
+    async def scenario() -> None:
+        image_module = pytest.importorskip("PIL.Image")
+        _install_astrbot_stubs()
+        sys.modules.pop("astrbot_plugin_img_gener.main", None)
+        module = importlib.import_module("astrbot_plugin_img_gener.main")
+        plugin = object.__new__(module.GPTImageGeneratorPlugin)
+        plugin.config = {
+            "generation": {"enable_evaluation": False},
+            "references": {"strict_references": True},
+        }
+        plugin._active_jobs = {}
+        plugin.references = module.CharacterReferenceManager(
+            [], data_dir=tmp_path, plugin_dir=tmp_path
+        )
+        plugin.user_profiles = module.UserProfileStore(tmp_path / "profiles.sqlite3")
+        plugin.user_profiles.ensure_profile("10001", display_name="首次画像用户")
+        plugin.gallery_store = module.GalleryStore(tmp_path / "gallery")
+        plugin.output_store = module.OutputStore(tmp_path / "outputs")
+        plugin.moderator = module.PromptModerator(enabled=False)
+        plugin._is_allowed = lambda event: True
+
+        class Limiter:
+            def __init__(self):
+                self.completed = []
+
+            async def acquire(self, user_id, group_id, *, bypass_limits=False):
+                del user_id, group_id, bypass_limits
+                return types.SimpleNamespace(allowed=True, lease_id="portrait-lease")
+
+            async def complete(self, lease_id):
+                self.completed.append(lease_id)
+
+            async def cancel(self, lease_id):
+                raise AssertionError(f"successful lease must not be cancelled: {lease_id}")
+
+        plugin.rate_limiter = Limiter()
+        generated_path = tmp_path / "generated.png"
+        image_module.new("RGB", (320, 480), (80, 120, 200)).save(generated_path)
+        captured = {}
+
+        class Client:
+            async def generate(self, prompt, *, size, quality):
+                captured.update(prompt=prompt, size=size, quality=quality)
+                return types.SimpleNamespace(
+                    content=generated_path.read_bytes(),
+                    media_type="image/png",
+                    extension=".png",
+                )
+
+            async def edit(self, prompt, sources, *, size, quality):
+                raise AssertionError(
+                    f"first portrait has no references: {prompt} {sources} {size} {quality}"
+                )
+
+        plugin._client = lambda: Client()
+
+        class Event:
+            def __init__(self):
+                self.sent = []
+
+            def get_sender_id(self):
+                return "99999"
+
+            def get_sender_name(self):
+                return "请求用户"
+
+            def get_group_id(self):
+                return "200"
+
+            def get_platform_name(self):
+                return "qq"
+
+            def get_messages(self):
+                return []
+
+            def is_admin(self):
+                return False
+
+            def chain_result(self, parts):
+                return parts
+
+            async def send(self, message):
+                self.sent.append(message)
+
+        result = await plugin._generate_image(
+            Event(),
+            "一名青年站在海边，保持用户描述的短发和蓝色外套",
+            portrait_user_qqs=("10001",),
+        )
+        profile = plugin.user_profiles.get("10001")
+
+        assert result is None
+        assert "一名青年站在海边" in captured["prompt"]
+        assert plugin.rate_limiter.completed == ["portrait-lease"]
+        assert plugin.gallery_store.count() == 1
+        assert profile is not None
+        assert len(profile.image_paths) == 1
+
+    asyncio.run(scenario())
+
+def test_duplicate_profile_alias_requires_numbered_ai_confirmation(tmp_path) -> None:
+    async def scenario() -> None:
+        _install_astrbot_stubs()
+        sys.modules.pop("astrbot_plugin_img_gener.main", None)
+        module = importlib.import_module("astrbot_plugin_img_gener.main")
+        plugin = object.__new__(module.GPTImageGeneratorPlugin)
+        plugin.user_profiles = module.UserProfileStore(tmp_path / "profiles.sqlite3")
+        plugin.user_profiles.ensure_profile("10001", display_name="小明")
+        plugin.user_profiles.ensure_profile("10002", display_name="小明")
+
+        class Bot:
+            async def call_action(self, **kwargs):
+                names = {10001: "当前小明甲", 10002: "当前小明乙"}
+                return {"card": names[kwargs["user_id"]]}
+
+        class Event:
+            bot = Bot()
+
+            def get_sender_id(self):
+                return "99999"
+
+            def get_group_id(self):
+                return "200"
+
+            def get_messages(self):
+                return []
+
+        subjects, error = await plugin._resolve_portrait_subjects(
+            Event(), "让小明站在海边", None
+        )
+
+        assert subjects == ()
+        assert error is not None
+        assert "当前没有受理生图任务" in error
+        assert "1.（10001）（当前小明甲）" in error
+        assert "2.（10002）（当前小明乙）" in error
+        assert "portrait_user_qqs" in error
+
+    asyncio.run(scenario())
+
+
+def test_self_portrait_refreshes_capped_group_alias_and_at_excludes_bot(
+    tmp_path,
+) -> None:
+    async def scenario() -> None:
+        _install_astrbot_stubs()
+        sys.modules.pop("astrbot_plugin_img_gener.main", None)
+        module = importlib.import_module("astrbot_plugin_img_gener.main")
+        plugin = object.__new__(module.GPTImageGeneratorPlugin)
+        plugin.user_profiles = module.UserProfileStore(tmp_path / "profiles.sqlite3")
+
+        class Event:
+            def get_sender_id(self):
+                return "10001"
+
+            def get_sender_name(self):
+                return "特别特别长的群聊昵称" * 4
+
+            def get_group_id(self):
+                return "200"
+
+            def get_self_id(self):
+                return "99999"
+
+            def get_messages(self):
+                return [module.Comp.At(qq="99999"), module.Comp.At(qq="10002")]
+
+        event = Event()
+        assert plugin._mentioned_qqs(event) == ("10002",)
+        assert plugin._self_portrait_requested("画我在海边散步")
+        assert not plugin._self_portrait_requested("帮我画一张我的猫")
+
+        subjects, error = await plugin._resolve_portrait_subjects(
+            event, "画我在海边散步", ["self"]
+        )
+        profile = plugin.user_profiles.get("10001")
+
+        assert error is None
+        assert subjects == ("10001", "10002")
+        assert profile is not None
+        assert len(profile.display_name) == 20
+        assert profile.display_name in profile.aliases
+
+    asyncio.run(scenario())
+
+
+def test_success_archive_updates_three_profile_candidates_and_gallery_commands(
+    tmp_path,
+) -> None:
+    async def scenario() -> None:
+        image_module = pytest.importorskip("PIL.Image")
+        _install_astrbot_stubs()
+        sys.modules.pop("astrbot_plugin_img_gener.main", None)
+        module = importlib.import_module("astrbot_plugin_img_gener.main")
+        plugin = object.__new__(module.GPTImageGeneratorPlugin)
+        plugin.gallery_store = module.GalleryStore(tmp_path / "gallery")
+        plugin.user_profiles = module.UserProfileStore(tmp_path / "profiles.sqlite3")
+        plugin.output_store = module.OutputStore(tmp_path / "outputs")
+        plugin.user_profiles.ensure_profile("10001", display_name="画像用户")
+
+        class Event:
+            def __init__(self):
+                self.stopped = False
+
+            def get_sender_id(self):
+                return "99999"
+
+            def get_sender_name(self):
+                return "请求用户"
+
+            def get_group_id(self):
+                return "200"
+
+            def stop_event(self):
+                self.stopped = True
+
+            def plain_result(self, message):
+                return message
+
+            def chain_result(self, parts):
+                return parts
+
+        event = Event()
+        for index in range(4):
+            image_path = tmp_path / f"source_{index}.png"
+            image_module.new("RGB", (320, 480), (index * 40, 20, 200)).save(
+                image_path
+            )
+            generated = types.SimpleNamespace(
+                content=image_path.read_bytes(),
+                extension=".png",
+                media_type="image/png",
+            )
+            record, profile_failures = await plugin._archive_generated_image(
+                event,
+                generated,
+                prompt=f"第 {index + 1} 张用户画像",
+                size="816x816",
+                quality="medium",
+                duration_seconds=10 + index,
+                job_id=index + 1,
+                portrait_user_qqs=("10001",),
+            )
+            assert record is not None
+            assert record.image_id == index + 1
+            assert profile_failures == ()
+
+        profile = plugin.user_profiles.get("10001")
+        assert profile is not None
+        assert [path.stem for path in profile.image_paths] == ["4", "3", "2"]
+
+        summary_results = plugin.history_command(event, "")
+        summary = await anext(summary_results)
+        assert "当前共保存 4 张成功图片" in summary
+
+        detail_results = plugin.history_command(event, "4")
+        detail = await anext(detail_results)
+        detail_text = next(part.text for part in detail if hasattr(part, "text"))
+        assert "图库编号：4" in detail_text
+        assert "请求用户（QQ：99999）" in detail_text
+        assert "第 4 张用户画像" in detail_text
+
+        random_results = plugin.history_command(event, "随机 4")
+        random_chain = await anext(random_results)
+        assert len(random_chain) == 1
+        grid_path = random_chain[0].path
+        with image_module.open(grid_path) as grid:
+            assert grid.size == (1536, 1536)
+
+    asyncio.run(scenario())
 
 def test_custom_legacy_allowlist_does_not_reject_configured_default() -> None:
     _install_astrbot_stubs()

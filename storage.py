@@ -18,6 +18,12 @@ class OutputStore:
         path.write_bytes(image.content)
         return path
 
+    def save_bytes(self, content: bytes, extension: str = ".png") -> Path:
+        suffix = extension if extension.startswith(".") else f".{extension}"
+        path = self.output_dir / f"{int(time.time())}_{uuid.uuid4().hex}{suffix}"
+        path.write_bytes(content)
+        return path
+
     def cleanup(self, *, now: float | None = None) -> int:
         if self.retention_days <= 0:
             return 0

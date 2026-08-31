@@ -6,6 +6,7 @@ import pytest
 from astrbot_plugin_img_gener.contact_sheet import (
     build_contact_sheet,
     build_contact_sheet_from_sources,
+    build_gallery_grid,
 )
 from astrbot_plugin_img_gener.errors import ImageGeneratorError
 
@@ -57,3 +58,25 @@ def test_build_contact_sheet_rejects_unreadable_file(tmp_path) -> None:
     broken.write_bytes(b"not an image")
     with pytest.raises(ImageGeneratorError):
         build_contact_sheet((broken,))
+@pytest.mark.parametrize(
+    ("count", "expected_size"),
+    [
+        (3, (2304, 768)),
+        (4, (1536, 1536)),
+        (6, (2304, 1536)),
+        (9, (2304, 2304)),
+    ],
+)
+def test_gallery_grid_adapts_to_requested_count(
+    tmp_path, count, expected_size
+) -> None:
+    paths = []
+    for index in range(count):
+        path = tmp_path / f"gallery_{index}.png"
+        _fake_image(path, color=(index * 20, 30, 200), size=(300, 500))
+        paths.append(path)
+
+    grid = build_gallery_grid(tuple(paths))
+
+    image = Image.open(io.BytesIO(grid.content))
+    assert image.size == expected_size

@@ -50,6 +50,28 @@ class CharacterReferenceManager:
         self.per_character_limit = max(1, per_character_limit)
         self.characters = tuple(self._parse_entries(entries))
 
+    def with_characters(
+        self, additional: tuple[CharacterReference, ...]
+    ) -> CharacterReferenceManager:
+        """Return a request-local manager containing persistent QQ profiles."""
+
+        clone = object.__new__(type(self))
+        clone.data_dir = self.data_dir
+        clone.plugin_dir = self.plugin_dir
+        clone.max_total_images = self.max_total_images
+        clone.max_image_bytes = self.max_image_bytes
+        clone.per_character_limit = self.per_character_limit
+        existing = {character.name.casefold() for character in self.characters}
+        clone.characters = (
+            *self.characters,
+            *tuple(
+                character
+                for character in additional
+                if character.name.casefold() not in existing
+            ),
+        )
+        return clone
+
     @staticmethod
     def _flatten_file_values(value: Any) -> list[str]:
         if value is None:
