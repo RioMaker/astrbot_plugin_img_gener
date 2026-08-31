@@ -306,7 +306,7 @@ class CharacterReferenceManager:
         use_sheet: bool = False,
         reference_filenames: tuple[str, ...] = (),
     ) -> str:
-        if not resolved.characters:
+        if not resolved.image_paths:
             return prompt
         lines = [prompt.strip()]
         if resolved.image_paths:
@@ -339,15 +339,5 @@ class CharacterReferenceManager:
                 "不要依据补充文字重新设计或自行添加外观设定。"
             )
 
-        # prompt_note is only a fallback for a character whose image is unusable
-        # and whose request was allowed to continue with strict_references off.
-        missing = set(resolved.missing_characters) | set(resolved.capped_characters)
-        fallback_lines = [
-            f"- 角色「{character.name}」未携带可用参考图：{character.prompt_note}"
-            for character in resolved.characters
-            if character.name in missing and character.prompt_note
-        ]
-        if fallback_lines:
-            lines.extend(["", "无可用参考图的人物文字后备设定：", *fallback_lines])
         return "\n".join(lines)
 

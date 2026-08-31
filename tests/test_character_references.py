@@ -175,7 +175,7 @@ def test_user_change_request_is_kept_without_injecting_prompt_note(tmp_path) -> 
     assert "除非上方中文生图提示词明确要求改变" in augmented
 
 
-def test_prompt_note_is_only_used_when_reference_image_is_missing(tmp_path) -> None:
+def test_missing_reference_keeps_user_prompt_without_prompt_note(tmp_path) -> None:
     manager = CharacterReferenceManager(
         [
             {
@@ -191,8 +191,8 @@ def test_prompt_note_is_only_used_when_reference_image_is_missing(tmp_path) -> N
 
     augmented = manager.augment_prompt("画可可子", resolved)
 
-    assert "无可用参考图的人物文字后备设定" in augmented
-    assert "紫色短发和星形发夹" in augmented
+    assert augmented == "画可可子"
+    assert "紫色短发和星形发夹" not in augmented
 
 
 def test_characters_beyond_global_cap_are_reported(tmp_path) -> None:

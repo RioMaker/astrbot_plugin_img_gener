@@ -1442,6 +1442,33 @@ class GPTImageGeneratorPlugin(Star):
             )
             return None
 
+    def _reference_resolution_error(
+        self,
+        resolved: ResolvedReferences,
+        *,
+        portrait_user_qqs: tuple[str, ...],
+    ) -> str | None:
+        if not resolved.image_paths or not self._bool(
+            "references", "strict_references", default=True
+        ):
+            return None
+
+        portrait_ids = set(portrait_user_qqs)
+        strict_missing = tuple(
+            name
+            for name in resolved.missing_characters
+            if name not in portrait_ids
+        )
+        if strict_missing:
+            return "人物参考图缺失或不可用：" + "、".join(strict_missing)
+        if resolved.capped_characters:
+            return (
+                "同时指定的人物超过了单次参考图上限，以下人物未能携带参考图："
+                + "、".join(resolved.capped_characters)
+                + "。请减少同框人物数量，或在插件设置中调大「单次最多携带参考图」。"
+            )
+        return None
+
     async def _generate_image(
         self,
         event: AstrMessageEvent,
@@ -1497,27 +1524,12 @@ class GPTImageGeneratorPlugin(Star):
             requested_characters or None,
             max_total_images=total_reference_limit - len(quoted_components),
         )
-        if resolved.unknown_requested_names and self._bool(
-            "references", "strict_references", default=True
-        ):
-            return "未配置这些人物参考：" + "、".join(resolved.unknown_requested_names)
-        strict_missing = tuple(
-            name
-            for name in resolved.missing_characters
-            if name not in set(portrait_user_qqs)
+        reference_error = self._reference_resolution_error(
+            resolved,
+            portrait_user_qqs=portrait_user_qqs,
         )
-        if strict_missing and self._bool(
-            "references", "strict_references", default=True
-        ):
-            return "人物参考图缺失或不可用：" + "、".join(strict_missing)
-        if resolved.capped_characters and self._bool(
-            "references", "strict_references", default=True
-        ):
-            return (
-                "同时指定的人物超过了单次参考图上限，以下人物未能携带参考图："
-                + "、".join(resolved.capped_characters)
-                + "。请减少同框人物数量，或在插件设置中调大「单次最多携带参考图」。"
-            )
+        if reference_error:
+            return reference_error
 
         user_id, group_id = self._identity(event)
         bypass_limits = bool(

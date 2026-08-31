@@ -53,3 +53,31 @@ def test_llm_tool_uses_background_task() -> None:
     assert "asyncio.create_task(" in source
     assert "_generation_start_message" in source
     assert "总用时" in source
+
+
+def test_agent_vitepress_document_tracks_public_capabilities() -> None:
+    document = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    metadata = (ROOT / "metadata.yaml").read_text(encoding="utf-8")
+    version_line = next(
+        line for line in metadata.splitlines() if line.startswith("version:")
+    )
+    version = version_line.split(":", 1)[1].strip().strip('"')
+
+    assert document.startswith("---\n")
+    assert f'pluginVersion: "{version}"' in document
+    document_lines = document.splitlines()
+    open_containers = sum(line.startswith("::: ") for line in document_lines)
+    close_containers = document_lines.count(":::")
+    assert open_containers == close_containers
+    assert "每次修改功能、命令、LLM 工具" in document
+    for capability in (
+        "generate_image",
+        "get_image_generation_status",
+        "/生图 <提示词>",
+        "/生图人物",
+        "/生图状态",
+        "/生图历史",
+        "portrait_user_qqs",
+        "REF-01",
+    ):
+        assert capability in document

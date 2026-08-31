@@ -2,7 +2,7 @@ name: astrbot_plugin_img_gener
 display_name: GPT Image 2 安全生图
 short_desc: 安全调用 GPT Image 2，支持真实状态、QQ 画像档案与永久生图图库。
 desc: 通过 UUAPI Images API 提供审核、限流、人物/引用图、QQ 画像三图候选、重名确认，以及按编号或随机拼图访问的永久图库。
-version: "0.1.18"
+version: "0.1.19"
 author: Rio
 repo: "https://github.com/RioMaker/astrbot_plugin_img_gener"
 astrbot_version: ">=4.13.0"

@@ -987,6 +987,55 @@ def test_first_qq_portrait_without_reference_uses_description_and_is_archived(
 
     asyncio.run(scenario())
 
+
+def test_missing_static_character_reference_falls_back_to_user_prompt(
+    tmp_path,
+) -> None:
+    _install_astrbot_stubs()
+    sys.modules.pop("astrbot_plugin_img_gener.main", None)
+    module = importlib.import_module("astrbot_plugin_img_gener.main")
+    plugin = object.__new__(module.GPTImageGeneratorPlugin)
+    plugin.config = {"references": {"strict_references": True}}
+    manager = module.CharacterReferenceManager(
+        [
+            {
+                "name": "可可子",
+                "reference_images": [str(tmp_path / "missing.png")],
+                "prompt_note": "不应自动加入的紫色短发设定",
+            }
+        ],
+        data_dir=tmp_path,
+        plugin_dir=tmp_path,
+    )
+
+    resolved = manager.resolve("画可可子站在海边", ["可可子"])
+
+    assert resolved.image_paths == ()
+    assert plugin._reference_resolution_error(
+        resolved, portrait_user_qqs=()
+    ) is None
+    assert manager.augment_prompt("画可可子站在海边", resolved) == (
+        "画可可子站在海边"
+    )
+
+
+def test_unknown_explicit_character_does_not_block_text_generation(tmp_path) -> None:
+    _install_astrbot_stubs()
+    sys.modules.pop("astrbot_plugin_img_gener.main", None)
+    module = importlib.import_module("astrbot_plugin_img_gener.main")
+    plugin = object.__new__(module.GPTImageGeneratorPlugin)
+    plugin.config = {"references": {"strict_references": True}}
+    manager = module.CharacterReferenceManager(
+        [], data_dir=tmp_path, plugin_dir=tmp_path
+    )
+    resolved = manager.resolve("画原创角色阿青", ["阿青"])
+
+    assert resolved.unknown_requested_names == ("阿青",)
+    assert plugin._reference_resolution_error(
+        resolved, portrait_user_qqs=()
+    ) is None
+
+
 def test_duplicate_profile_alias_requires_numbered_ai_confirmation(tmp_path) -> None:
     async def scenario() -> None:
         _install_astrbot_stubs()
