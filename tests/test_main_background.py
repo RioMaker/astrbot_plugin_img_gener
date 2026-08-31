@@ -775,8 +775,15 @@ def test_status_command_and_agent_tool_list_authoritative_state(tmp_path) -> Non
         assert "审核模型" not in message
         assert "生图接口" not in message
 
+        tool = module.GPTImageGeneratorPlugin.get_image_generation_status
+        tool_annotations = tool.__annotations__
+        tool_doc = tool.__doc__ or ""
+        assert tool_annotations["history_limit"] == "str"
+        assert "history_limit(string)" in tool_doc
+        assert "history_limit(integer)" not in tool_doc
+
         tool_message = await plugin.get_image_generation_status(
-            event, include_history=True, history_limit=5
+            event, include_history=True, history_limit="5"
         )
         assert "你的任务确实在队列或处理中：1 个" in tool_message
         assert "生成图片" in tool_message
@@ -864,7 +871,7 @@ def test_agent_status_reports_no_active_task_and_recent_502_failure(tmp_path) ->
 
         event = Event()
         report = await plugin.get_image_generation_status(
-            event, include_history=True, history_limit=5
+            event, include_history=True, history_limit="5"
         )
 
         assert "当前没有你的任务在队列或处理中" in report

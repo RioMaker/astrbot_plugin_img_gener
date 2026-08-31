@@ -1796,7 +1796,7 @@ class GPTImageGeneratorPlugin(Star):
         self,
         event: AstrMessageEvent,
         include_history: bool = True,
-        history_limit: int = 5,
+        history_limit: str = "5",
     ) -> str:
         """Query authoritative image task progress, history, quotas, and cooldowns.
 
@@ -1809,7 +1809,7 @@ class GPTImageGeneratorPlugin(Star):
 
         Args:
             include_history(boolean): Include the current user's recent accepted task records; default true.
-            history_limit(integer): Number of the current user's recent records to return, from 1 to 20; default 5.
+            history_limit(string): Number of the current user's recent records to return as numeric text, from 1 to 20; default "5".
         """  # noqa: E501
         return await self._status_report(
             event,
