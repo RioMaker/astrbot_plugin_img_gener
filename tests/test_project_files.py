@@ -73,11 +73,15 @@ def test_agent_vitepress_document_tracks_public_capabilities() -> None:
     for capability in (
         "generate_image",
         "get_image_generation_status",
+        "get_user_portrait_reference",
         "/生图 <提示词>",
         "/生图人物",
+        "/生图参考图",
+        "/生图参考图 设置",
         "/生图状态",
         "/生图历史",
         "portrait_user_qqs",
         "REF-01",
+        "唯一参考图",
     ):
         assert capability in document

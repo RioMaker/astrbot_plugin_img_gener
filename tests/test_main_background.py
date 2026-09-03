@@ -358,6 +358,123 @@ def test_quoted_reply_images_are_loaded_as_reference_sources(tmp_path) -> None:
     asyncio.run(scenario())
 
 
+def test_portrait_reference_command_and_tool_enforce_owner_permissions(
+    tmp_path,
+) -> None:
+    async def scenario() -> None:
+        _install_astrbot_stubs()
+        sys.modules.pop("astrbot_plugin_img_gener.main", None)
+        module = importlib.import_module("astrbot_plugin_img_gener.main")
+        plugin = object.__new__(module.GPTImageGeneratorPlugin)
+        plugin.config = {"references": {"max_image_size_mb": 1}}
+        plugin.user_profiles = module.UserProfileStore(tmp_path / "profiles.sqlite3")
+
+        first_path = tmp_path / "first.png"
+        first_path.write_bytes(b"\x89PNG\r\n\x1a\nfirst")
+        second_path = tmp_path / "second.jpg"
+        second_path.write_bytes(b"\xff\xd8\xffsecond")
+
+        class Event:
+            def __init__(
+                self,
+                *,
+                sender_id="10001",
+                sender_name="小明",
+                admin=False,
+                messages=None,
+            ):
+                self.sender_id = sender_id
+                self.sender_name = sender_name
+                self.admin = admin
+                self.messages = list(messages or [])
+                self.sent = []
+                self.stopped = False
+
+            def get_sender_id(self):
+                return self.sender_id
+
+            def get_sender_name(self):
+                return self.sender_name
+
+            def get_group_id(self):
+                return "200"
+
+            def get_messages(self):
+                return self.messages
+
+            def is_admin(self):
+                return self.admin
+
+            def stop_event(self):
+                self.stopped = True
+
+            def plain_result(self, message):
+                return message
+
+            def chain_result(self, parts):
+                return parts
+
+            async def send(self, message):
+                self.sent.append(message)
+
+        owner = Event(messages=[module.Comp.Image(str(first_path))])
+        set_results = plugin.portrait_reference_command(owner, "设置")
+        set_chain = await anext(set_results)
+        assert owner.stopped
+        assert "已替换 QQ 10001" in next(
+            part.text for part in set_chain if hasattr(part, "text")
+        )
+        profile = plugin.user_profiles.get("10001")
+        assert profile is not None
+        assert len(profile.image_paths) == 1
+        assert profile.image_paths[0].read_bytes().endswith(b"first")
+
+        owner.messages = [
+            module.Comp.Reply(chain=[module.Comp.Image(str(second_path))])
+        ]
+        replace_results = plugin.portrait_reference_command(owner, "替换")
+        replace_chain = await anext(replace_results)
+        assert "已替换 QQ 10001" in next(
+            part.text for part in replace_chain if hasattr(part, "text")
+        )
+        profile = plugin.user_profiles.get("10001")
+        assert profile is not None
+        assert len(profile.image_paths) == 1
+        assert profile.image_paths[0].suffix == ".jpg"
+        assert profile.image_paths[0].read_bytes().endswith(b"second")
+
+        view_results = plugin.portrait_reference_command(owner, "")
+        view_chain = await anext(view_results)
+        assert any(isinstance(part, module.Comp.Image) for part in view_chain)
+
+        tool_result = await plugin.get_user_portrait_reference(owner, "self")
+        assert tool_result == "已向用户发送档案中当前唯一的本体参考图。"
+        assert len(owner.sent) == 1
+        assert any(isinstance(part, module.Comp.Image) for part in owner.sent[0])
+
+        tool = module.GPTImageGeneratorPlugin.get_user_portrait_reference
+        tool_annotations = tool.__annotations__
+        tool_doc = tool.__doc__ or ""
+        assert tool_annotations["target_user_qq"] == "str"
+        assert "target_user_qq(string)" in tool_doc
+
+        denied = await plugin.get_user_portrait_reference(owner, "10002")
+        assert "只有 AstrBot 管理员" in denied
+
+        plugin.user_profiles.ensure_profile("10002", display_name="小红")
+        admin = Event(sender_id="99999", sender_name="管理员", admin=True)
+        list_results = plugin.portrait_reference_command(admin, "列表")
+        listing = await anext(list_results)
+        assert "（10001）（小明）— 已设置" in listing
+        assert "（10002）（小红）— 未设置" in listing
+
+        admin_view_results = plugin.portrait_reference_command(admin, "10001")
+        admin_view_chain = await anext(admin_view_results)
+        assert any(isinstance(part, module.Comp.Image) for part in admin_view_chain)
+
+    asyncio.run(scenario())
+
+
 def test_generation_uploads_quoted_reply_image(tmp_path) -> None:
     async def scenario() -> None:
         _install_astrbot_stubs()
@@ -1122,7 +1239,7 @@ def test_self_portrait_refreshes_capped_group_alias_and_at_excludes_bot(
     asyncio.run(scenario())
 
 
-def test_success_archive_updates_three_profile_candidates_and_gallery_commands(
+def test_success_archive_updates_single_profile_reference_and_gallery_commands(
     tmp_path,
 ) -> None:
     async def scenario() -> None:
@@ -1185,7 +1302,7 @@ def test_success_archive_updates_three_profile_candidates_and_gallery_commands(
 
         profile = plugin.user_profiles.get("10001")
         assert profile is not None
-        assert [path.stem for path in profile.image_paths] == ["4", "3", "2"]
+        assert [path.stem for path in profile.image_paths] == ["4"]
 
         summary_results = plugin.history_command(event, "")
         summary = await anext(summary_results)

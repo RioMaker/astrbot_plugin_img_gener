@@ -834,6 +834,61 @@ class GPTImageGeneratorPlugin(Star):
         return qq
 
     @staticmethod
+    def _event_is_admin(event: AstrMessageEvent) -> bool:
+        checker = getattr(event, "is_admin", None)
+        try:
+            return bool(checker()) if callable(checker) else False
+        except Exception:
+            return False
+
+    def _portrait_reference_target(
+        self, event: AstrMessageEvent, raw_target: str
+    ) -> tuple[str | None, str | None]:
+        profile_store = getattr(self, "user_profiles", None)
+        if profile_store is None:
+            return None, "用户画像档案暂时不可用。"
+        sender_qq = profile_store.normalize_qq(str(event.get_sender_id() or ""))
+        token = str(raw_target or "").strip()
+        if not token or token.casefold() in {"self", "me"} or token in {
+            "我",
+            "自己",
+            "本人",
+            "我的",
+        }:
+            target_qq = sender_qq
+        else:
+            match = re.fullmatch(r"(?:qq:)?(\d{5,20})", token, re.I)
+            if match is None:
+                return None, "请使用 self、自己或 5～20 位 QQ 号指定用户。"
+            target_qq = match.group(1)
+        if not target_qq:
+            return None, "无法识别当前用户的 QQ 号。"
+        if target_qq != sender_qq and not self._event_is_admin(event):
+            return None, "只有 AstrBot 管理员可以查看或修改他人的本体参考图。"
+        return target_qq, None
+
+    async def _portrait_reference_image(
+        self, event: AstrMessageEvent, raw_target: str
+    ) -> tuple[str, Path | None]:
+        target_qq, error = self._portrait_reference_target(event, raw_target)
+        if error or target_qq is None:
+            return error or "无法识别目标用户。", None
+        try:
+            profile = self.user_profiles.get(target_qq)
+        except Exception:
+            logger.exception(
+                "[img_gener] failed to read portrait reference qq=%s", target_qq
+            )
+            return "用户画像档案暂时不可用，请联系管理员查看日志。", None
+        if profile is None or not profile.image_paths:
+            return f"QQ {target_qq} 尚未设置本体参考图。", None
+        display_name = await self._group_member_name(event, target_qq)
+        return (
+            f"QQ {target_qq}（{display_name}）当前唯一的本体参考图：",
+            profile.image_paths[0],
+        )
+
+    @staticmethod
     def _self_portrait_requested(text: str) -> bool:
         compact = " ".join(str(text or "").split())
         patterns = (
@@ -1019,8 +1074,36 @@ class GPTImageGeneratorPlugin(Star):
                     images.append(quoted_segment)
         return tuple(images)
 
+    def _event_image_components(self, event: AstrMessageEvent) -> tuple[Any, ...]:
+        """Return direct and replied Image components for profile replacement."""
+
+        getter = getattr(event, "get_messages", None)
+        try:
+            chain = getter() if callable(getter) else event.message_obj.message
+        except Exception:
+            return ()
+        image_cls = getattr(Comp, "Image", None)
+        reply_cls = getattr(Comp, "Reply", None)
+        if image_cls is None:
+            return ()
+        images: list[Any] = []
+        for segment in chain or ():
+            if isinstance(segment, image_cls):
+                images.append(segment)
+                continue
+            is_reply = bool(reply_cls is not None and isinstance(segment, reply_cls))
+            is_reply = is_reply or type(segment).__name__.casefold() == "reply"
+            if not is_reply:
+                continue
+            for quoted_segment in getattr(segment, "chain", None) or ():
+                if isinstance(quoted_segment, image_cls):
+                    images.append(quoted_segment)
+        return tuple(images)
+
     @staticmethod
-    def _reference_media_type(content: bytes) -> tuple[str, str]:
+    def _reference_media_type(
+        content: bytes, *, source_label: str = "引用消息中的图片"
+    ) -> tuple[str, str]:
         if content.startswith(b"\x89PNG\r\n\x1a\n"):
             return "image/png", ".png"
         if content.startswith(b"\xff\xd8\xff"):
@@ -1028,13 +1111,17 @@ class GPTImageGeneratorPlugin(Star):
         if content.startswith(b"RIFF") and content[8:12] == b"WEBP":
             return "image/webp", ".webp"
         raise ImageGeneratorError(
-            "引用消息中的图片格式不受支持，仅支持 PNG、JPEG 或 WebP。"
+            f"{source_label}格式不受支持，仅支持 PNG、JPEG 或 WebP。"
         )
 
-    async def _load_quoted_image_sources(
-        self, components: tuple[Any, ...]
+    async def _load_image_sources(
+        self,
+        components: tuple[Any, ...],
+        *,
+        source_label: str,
+        filename_prefix: str,
     ) -> list[tuple[str, bytes, str]]:
-        """Resolve quoted AstrBot Image components and validate their bytes."""
+        """Resolve AstrBot Image components and validate their bytes."""
 
         max_bytes = (
             self._int("references", "max_image_size_mb", default=12, minimum=1)
@@ -1046,8 +1133,8 @@ class GPTImageGeneratorPlugin(Star):
             converter = getattr(component, "convert_to_file_path", None)
             if not callable(converter):
                 raise ImageGeneratorError(
-                    "当前消息平台无法读取引用图片，请重新发送图片后再试。",
-                    detail="quoted image component misses convert_to_file_path",
+                    f"当前消息平台无法读取{source_label}，请重新发送图片后再试。",
+                    detail=f"{filename_prefix} component misses convert_to_file_path",
                 )
             try:
                 raw_path = await converter()
@@ -1059,19 +1146,30 @@ class GPTImageGeneratorPlugin(Star):
                     raise OSError("resolved image is empty")
                 if size > max_bytes:
                     raise ImageGeneratorError(
-                        "引用消息中的图片超过单张大小上限，请压缩后重新发送。"
+                        f"{source_label}超过单张大小上限，请压缩后重新发送。"
                     )
                 content = await asyncio.to_thread(path.read_bytes)
             except ImageGeneratorError:
                 raise
             except Exception as exc:
                 raise ImageGeneratorError(
-                    "引用消息中的图片已失效或无法读取，请重新发送图片后再试。",
-                    detail=f"quoted_image={index} error={type(exc).__name__}: {exc}",
+                    f"{source_label}已失效或无法读取，请重新发送图片后再试。",
+                    detail=f"{filename_prefix}={index} error={type(exc).__name__}: {exc}",
                 ) from exc
-            media_type, suffix = self._reference_media_type(content)
-            sources.append((f"quoted_{index}{suffix}", content, media_type))
+            media_type, suffix = self._reference_media_type(
+                content, source_label=source_label
+            )
+            sources.append((f"{filename_prefix}_{index}{suffix}", content, media_type))
         return sources
+
+    async def _load_quoted_image_sources(
+        self, components: tuple[Any, ...]
+    ) -> list[tuple[str, bytes, str]]:
+        return await self._load_image_sources(
+            components,
+            source_label="引用消息中的图片",
+            filename_prefix="quoted",
+        )
 
     @staticmethod
     def _augment_quoted_reference_prompt(
@@ -1829,6 +1927,32 @@ class GPTImageGeneratorPlugin(Star):
             history_limit=min(20, as_int(history_limit, 5, minimum=1)),
         )
 
+    @filter.llm_tool(name="get_user_portrait_reference")
+    async def get_user_portrait_reference(
+        self,
+        event: AstrMessageEvent,
+        target_user_qq: str = "self",
+    ) -> str:
+        """Send the authoritative canonical portrait reference for one QQ user.
+
+        Call this read-only tool when the user asks to see, inspect, or confirm
+        their currently stored personal portrait reference. Ordinary users may
+        retrieve only their own image by using "self". AstrBot administrators
+        may provide an explicit QQ number to retrieve another user's image.
+        Never guess that an image exists from chat history; relay the exact result.
+
+        Args:
+            target_user_qq(string): "self" for the requester, or an explicit QQ
+                number when the requester is an AstrBot administrator.
+        """
+        message, image_path = await self._portrait_reference_image(
+            event, target_user_qq
+        )
+        if image_path is None:
+            return message
+        await event.send(self._completion_chain(event, message, image_path))
+        return "已向用户发送档案中当前唯一的本体参考图。"
+
     @filter.llm_tool(name="generate_image")
     async def generate_image(
         self,
@@ -1854,9 +1978,9 @@ class GPTImageGeneratorPlugin(Star):
 
         For a portrait of the requester, pass "self" in portrait_user_qqs. For a
         user explicitly mentioned with @, pass that QQ number; the plugin also reads
-        At components directly. Existing QQ portrait profiles use up to three recent
-        successful images as references. If an alias belongs to multiple QQ users,
-        do not guess: return the numbered QQ/name candidates to the user, ask them
+        At components directly. Each QQ portrait profile uses only its one current
+        canonical reference image. If an alias belongs to multiple QQ users, do not
+        guess: return the numbered QQ/name candidates to the user, ask them
         to reply with a number, then call this tool again with the confirmed QQ.
 
         IMPORTANT: generation runs in the BACKGROUND and typically takes about 3
@@ -2018,6 +2142,120 @@ class GPTImageGeneratorPlugin(Star):
             source="/生图",
         )
         yield event.plain_result(await self._start_notice(event, selected_size))
+
+    @filter.command("生图参考图", alias={"本体参考图", "画像参考图"})
+    async def portrait_reference_command(
+        self, event: AstrMessageEvent, query: GreedyStr
+    ):
+        """查看或替换 QQ 用户当前唯一的本体参考图。"""
+
+        event.stop_event()
+        tail = str(query or "").strip()
+        parts = tail.split()
+        action = parts[0].casefold() if parts else ""
+
+        if action in {"列表", "list"}:
+            if len(parts) != 1:
+                yield event.plain_result("用法：/生图参考图 列表")
+                return
+            if not self._event_is_admin(event):
+                yield event.plain_result("只有 AstrBot 管理员可以查看画像档案列表。")
+                return
+            profile_store = getattr(self, "user_profiles", None)
+            if profile_store is None:
+                yield event.plain_result("用户画像档案暂时不可用。")
+                return
+            try:
+                profiles = profile_store.all_profiles()
+            except Exception:
+                logger.exception("[img_gener] failed to list user portrait profiles")
+                yield event.plain_result("用户画像档案暂时不可用，请联系管理员查看日志。")
+                return
+            if not profiles:
+                yield event.plain_result("尚未建立任何 QQ 用户画像档案。")
+                return
+            lines = ["QQ 用户画像档案："]
+            for index, profile in enumerate(profiles, start=1):
+                name = profile.display_name or "未记录群名"
+                state = "已设置" if profile.image_paths else "未设置"
+                lines.append(f"{index}.（{profile.qq}）（{name}）— {state}")
+            lines.extend(
+                (
+                    "查看图片：/生图参考图 <QQ号>",
+                    "替换图片：发送或引用一张图片并使用 /生图参考图 设置 <QQ号>",
+                )
+            )
+            yield event.plain_result("\n".join(lines))
+            return
+
+        setting = action in {"设置", "替换", "set"}
+        if setting and len(parts) > 2:
+            yield event.plain_result(
+                "用法：发送或引用一张图片并使用 /生图参考图 设置 [QQ号]"
+            )
+            return
+        if not setting and len(parts) > 1:
+            yield event.plain_result("用法：/生图参考图 [QQ号]")
+            return
+        if setting:
+            raw_target = parts[1] if len(parts) == 2 else "self"
+        else:
+            raw_target = parts[0] if parts else "self"
+
+        if not setting:
+            message, image_path = await self._portrait_reference_image(
+                event, raw_target
+            )
+            if image_path is None:
+                yield event.plain_result(message)
+            else:
+                yield self._completion_chain(event, message, image_path)
+            return
+
+        target_qq, error = self._portrait_reference_target(event, raw_target)
+        if error or target_qq is None:
+            yield event.plain_result(error or "无法识别目标用户。")
+            return
+        components = self._event_image_components(event)
+        if len(components) != 1:
+            yield event.plain_result(
+                "请在当前消息发送或引用恰好 1 张图片，再使用 "
+                "/生图参考图 设置 [QQ号]。"
+            )
+            return
+        try:
+            sources = await self._load_image_sources(
+                components,
+                source_label="用于设置个人参考图的图片",
+                filename_prefix="profile",
+            )
+            filename, content, _media_type = sources[0]
+            display_name = await self._group_member_name(event, target_qq)
+            self.user_profiles.ensure_profile(
+                target_qq,
+                display_name=display_name,
+                group_id=str(event.get_group_id() or "") or None,
+            )
+            image_path = self.user_profiles.set_manual_reference(
+                target_qq,
+                content=content,
+                extension=Path(filename).suffix,
+            )
+        except ImageGeneratorError as exc:
+            yield event.plain_result(exc.public_message)
+            return
+        except Exception:
+            logger.exception(
+                "[img_gener] failed to replace portrait reference qq=%s",
+                target_qq,
+            )
+            yield event.plain_result("替换本体参考图失败，请联系管理员查看日志。")
+            return
+        yield self._completion_chain(
+            event,
+            f"已替换 QQ {target_qq} 当前唯一的本体参考图：",
+            image_path,
+        )
 
     @filter.command("生图人物", alias={"生图角色"})
     async def character_list_command(self, event: AstrMessageEvent):

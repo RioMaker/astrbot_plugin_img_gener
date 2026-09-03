@@ -135,10 +135,11 @@ AstrBot/data/plugin_data/astrbot_plugin_img_gener/rate_limits.sqlite3
 
 - 每次用户描述自己时都会读取当前群名片或昵称并追加到别名；
 - 单个别名最多 20 个字符，超出部分不会写入档案；
-- 每个 QQ 最多保留最近 3 张成功画像作为当前参考候选，可以为 0～3 张；
-- 没有候选图时按用户本次描述进行首次文生图，不受静态人物“缺图拒绝”影响；
-- 新生成的成功图片会进入永久图库，并成为该 QQ 最新的画像候选；第 4 张加入后，
-  最旧候选只退出画像档案，原图仍保留在永久图库中。
+- 每个 QQ 只保留 0 或 1 张当前本体参考图，不会再同时上传多张历史画像；
+- 没有本体参考图时按用户本次描述进行首次文生图，不受静态人物“缺图拒绝”影响；
+- 新生成的本人画像会进入永久图库，并替换为该 QQ 唯一的本体参考图；
+- 手动上传的参考图存于插件长期数据目录；以后被新画像替换时只更新档案关联，永久图库
+  中的历史生成图不会删除。
 
 聊天模型为请求人本人画像时，应在 `portrait_user_qqs` 传入 `self`；确认了 `@` 用户
 或 QQ 号后传入对应 QQ。已存在的唯一别名也可自动匹配。若同一别名属于多个 QQ，插件
@@ -151,6 +152,17 @@ AstrBot/data/plugin_data/astrbot_plugin_img_gener/rate_limits.sqlite3
 
 确认后 AI 再次调用 `generate_image`，并在 `portrait_user_qqs` 中传入选中项的 QQ 号。
 在确认之前不会建立后台任务，也不会回复“正在生成”。
+
+查看与替换：
+
+- 普通用户使用 `/生图参考图` 查看自己的当前图片；
+- 发送一张图片，或回复一条只含一张图片的历史消息，再使用 `/生图参考图 设置`
+  即可替换自己的当前图片；
+- AstrBot 管理员使用 `/生图参考图 列表` 查看全部 QQ 档案和设置状态；
+- 管理员使用 `/生图参考图 <QQ号>` 查看指定用户，使用
+  `/生图参考图 设置 <QQ号>` 替换指定用户；
+- Agent 可调用 `get_user_portrait_reference` 发送档案中的真实图片。普通用户仍只能
+  查询自己，只有 AstrBot 管理员能指定其他 QQ。
 
 ### 多角色同框
 
@@ -228,7 +240,7 @@ generate_image(
 生成完成后，插件会：
 
 1. 把成功图片永久归档，并分配简单自增的图库编号；
-2. 若这是 QQ 用户画像，更新对应 QQ 最近 3 张画像候选；
+2. 若这是 QQ 用户画像，替换对应 QQ 当前唯一的本体参考图；
 3. 发送一条 `@发起人 + 图库编号 + 尺寸/质量/总用时 + 实际生图提示词 + 图片`；
 4. 再调用“安全审核 → 识图模型”对图片给出 1~3 句简短评价并 `@发起人` 发送；
    识图失败时退回为“仅根据提示词”评价。可在“生成参数 → 生成后发送简短评价”
@@ -239,6 +251,9 @@ generate_image(
 ```text
 /生图 一只戴宇航头盔的橘猫，儿童绘本风格
 /生图人物
+/生图参考图
+/生图参考图 设置
+/生图参考图 列表
 /生图状态
 /生图历史
 /生图历史 1002
@@ -280,9 +295,12 @@ generate_image(
 最近失败原因、历史、个人/群余量或冷却时，聊天模型必须调用该工具，不能根据先前的
 “已受理”回复自行判断仍在生成。工具默认返回最近 5 条本人记录，可查询 1～20 条。
 
+用户要求查看自己的当前本体参考图时，Agent 应调用 `get_user_portrait_reference`；
+该工具会实际发送档案图片，并保持与聊天指令相同的本人/管理员权限边界。
+
 如果聊天模型一直不调用工具，请先在 AstrBot WebUI 的 Tool 管理中确认
-`generate_image` 和 `get_image_generation_status` 均已启用，并确认当前聊天模型支持
-Function Calling。
+`generate_image`、`get_image_generation_status` 和 `get_user_portrait_reference`
+均已启用，并确认当前聊天模型支持 Function Calling。
 
 ## 文件与模块
 
@@ -292,7 +310,7 @@ moderation.py            本地硬规则与 LLM 审核
 rate_limiter.py          SQLite 用户/群配额、冷却和并发预留
 generation_history.py    SQLite 生图任务阶段、终态和个人运行记录
 gallery.py               永久成功图片图库、编号和元数据
-user_profiles.py         QQ 用户画像、20 字别名和最近 3 张候选
+user_profiles.py         QQ 用户画像、20 字别名和唯一长期本体参考图
 character_references.py  静态人物与动态 QQ 画像参考解析
 contact_sheet.py         人物 REF 拼图和随机图库网格（Pillow）
 image_client.py          UUAPI Images Generations/Edits 客户端

@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import sqlite3
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,7 +14,8 @@ except ImportError:  # pragma: no cover - direct script-style import fallback.
 
 
 MAX_PROFILE_ALIASES_LENGTH = 20
-MAX_PROFILE_IMAGES = 3
+MAX_PROFILE_IMAGES = 1
+ALLOWED_PROFILE_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,11 +33,13 @@ class AliasMatch:
 
 
 class UserProfileStore:
-    """QQ-keyed portrait profiles with bounded aliases and reference candidates."""
+    """QQ-keyed portrait profiles with aliases and one canonical reference."""
 
     def __init__(self, database_path: Path) -> None:
         database_path.parent.mkdir(parents=True, exist_ok=True)
         self.database_path = database_path
+        self.reference_dir = database_path.parent / "user_profile_references"
+        self.reference_dir.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
@@ -77,6 +81,21 @@ class UserProfileStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_user_profile_images_recent
                     ON user_profile_images(qq, created_at DESC, gallery_id DESC);
+                """
+            )
+            connection.execute(
+                """
+                DELETE FROM user_profile_images
+                WHERE rowid IN (
+                    SELECT rowid FROM (
+                        SELECT rowid,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY qq
+                                   ORDER BY created_at DESC, gallery_id DESC
+                               ) AS position
+                        FROM user_profile_images
+                    ) WHERE position > 1
+                )
                 """
             )
 
@@ -178,6 +197,49 @@ class UserProfileStore:
                 )
         return removed
 
+    def set_manual_reference(
+        self,
+        qq: str,
+        *,
+        content: bytes,
+        extension: str,
+        now: float | None = None,
+    ) -> Path:
+        normalized_qq = self.normalize_qq(qq)
+        if not normalized_qq:
+            raise ValueError("QQ number is required")
+        if not content:
+            raise ValueError("reference image content is required")
+        suffix = str(extension or "").strip().lower()
+        if suffix and not suffix.startswith("."):
+            suffix = f".{suffix}"
+        if suffix not in ALLOWED_PROFILE_IMAGE_SUFFIXES:
+            raise ValueError("unsupported reference image format")
+
+        safe_qq = re.sub(r"[^0-9A-Za-z_.-]+", "_", normalized_qq).strip("._")
+        if not safe_qq:
+            raise ValueError("QQ number is invalid")
+        profile_dir = self.reference_dir / safe_qq
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        final_path = profile_dir / f"reference{suffix}"
+        temp_path = profile_dir / f".{uuid.uuid4().hex}.tmp"
+        try:
+            temp_path.write_bytes(content)
+            temp_path.replace(final_path)
+        finally:
+            temp_path.unlink(missing_ok=True)
+
+        self.add_reference(
+            normalized_qq,
+            gallery_id=0,
+            image_path=final_path,
+            now=now,
+        )
+        for stale_path in profile_dir.glob("reference.*"):
+            if stale_path != final_path:
+                stale_path.unlink(missing_ok=True)
+        return final_path.resolve()
+
     def get(self, qq: str) -> UserProfile | None:
         normalized_qq = self.normalize_qq(qq)
         with self._connect() as connection:
@@ -226,6 +288,13 @@ class UserProfileStore:
                 result.append(profile)
                 seen.add(normalized)
         return tuple(result)
+
+    def all_profiles(self) -> tuple[UserProfile, ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT qq FROM user_profiles ORDER BY qq"
+            ).fetchall()
+        return self.profiles(tuple(str(row["qq"]) for row in rows))
 
     @staticmethod
     def _contains(text: str, alias: str) -> bool:
