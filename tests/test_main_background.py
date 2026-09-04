@@ -17,6 +17,10 @@ def _install_astrbot_stubs() -> None:
     command_module = types.ModuleType("astrbot.core.star.filter.command")
     path_module = types.ModuleType("astrbot.core.utils.astrbot_path")
 
+    class _MessageChain:
+        def __init__(self, chain=None):
+            self.chain = list(chain or [])
+
     class _Decorator:
         def __call__(self, *args, **kwargs):
             del args, kwargs
@@ -66,6 +70,7 @@ def _install_astrbot_stubs() -> None:
     api.AstrBotConfig = dict
     api.logger = _Logger()
     event_module.AstrMessageEvent = object
+    event_module.MessageChain = _MessageChain
     event_module.filter = _Filter()
     star_module.Context = object
     star_module.Star = _Star
@@ -138,8 +143,164 @@ def test_llm_tool_returns_before_background_generation_finishes() -> None:
 
         release.set()
         await task
-        assert event.sent == ["后台完成"]
+        assert len(event.sent) == 1
+        assert event.sent[0].chain[0].qq == "1"
+        assert event.sent[0].chain[1].text == " 任务 #1 未完成：后台完成"
         assert plugin._active_jobs == {}
+
+    asyncio.run(scenario())
+
+
+def test_consecutive_group_jobs_keep_owner_route_prompt_and_image_snapshot(
+    tmp_path,
+) -> None:
+    async def scenario() -> None:
+        _install_astrbot_stubs()
+        sys.modules.pop("astrbot_plugin_img_gener.main", None)
+        module = importlib.import_module("astrbot_plugin_img_gener.main")
+        plugin = object.__new__(module.GPTImageGeneratorPlugin)
+        plugin._background_tasks = set()
+        plugin._active_jobs = {}
+        plugin._next_job_id = 0
+        plugin.config = {
+            "references": {
+                "enable_quoted_images": True,
+                "max_quoted_images": 2,
+                "max_image_size_mb": 1,
+            }
+        }
+        plugin._is_allowed = lambda event: True
+        plugin.moderator = module.PromptModerator(enabled=False)
+        plugin.references = module.CharacterReferenceManager(
+            [],
+            data_dir=tmp_path,
+            plugin_dir=tmp_path,
+            max_total_images=4,
+        )
+
+        class Context:
+            def __init__(self):
+                self.sent = []
+
+            async def send_message(self, origin, message):
+                self.sent.append((origin, message))
+
+        plugin.context = Context()
+        release = asyncio.Event()
+        captured = []
+        resolution_started = asyncio.Event()
+        release_resolution = asyncio.Event()
+        resolution_calls = 0
+
+        async def fake_resolve(event, text, requested):
+            del event, text, requested
+            nonlocal resolution_calls
+            resolution_calls += 1
+            if resolution_calls == 1:
+                resolution_started.set()
+                await release_resolution.wait()
+            return (), None
+
+        plugin._resolve_portrait_subjects = fake_resolve
+
+        async def fake_generate(event, prompt, **kwargs):
+            await release.wait()
+            captured.append(
+                {
+                    "sender_id": event.get_sender_id(),
+                    "group_id": event.get_group_id(),
+                    "origin": event.unified_msg_origin,
+                    "prompt": prompt,
+                    "quoted": kwargs["quoted_image_sources"],
+                    "reference_prompt": kwargs["reference_prompt"],
+                }
+            )
+            return "模拟完成"
+
+        plugin._generate_image = fake_generate
+
+        first_image = tmp_path / "first.png"
+        first_image.write_bytes(b"\x89PNG\r\n\x1a\nfirst-user")
+        second_image = tmp_path / "second.png"
+        second_image.write_bytes(b"\x89PNG\r\n\x1a\nsecond-user")
+
+        class MutableEvent:
+            def __init__(self):
+                self.sender_id = "10001"
+                self.sender_name = "用户甲"
+                self.group_id = "200"
+                self.unified_msg_origin = "qq:GroupMessage:200"
+                self.message_text = "用户甲的红色列车请求"
+                self.messages = [
+                    module.Comp.Reply(
+                        chain=[module.Comp.Image(str(first_image))]
+                    )
+                ]
+
+            def get_platform_name(self):
+                return "qq"
+
+            def get_sender_id(self):
+                return self.sender_id
+
+            def get_sender_name(self):
+                return self.sender_name
+
+            def get_group_id(self):
+                return self.group_id
+
+            def get_message_str(self):
+                return self.message_text
+
+            def get_messages(self):
+                return self.messages
+
+            def is_admin(self):
+                return False
+
+        event = MutableEvent()
+        first_request = asyncio.create_task(
+            plugin.generate_image(event, "红色列车驶过雪山，电影感构图")
+        )
+        await resolution_started.wait()
+        event.sender_id = "10002"
+        event.sender_name = "用户乙"
+        event.unified_msg_origin = "qq:GroupMessage:200"
+        event.message_text = "用户乙的蓝色帆船请求"
+        event.messages = [
+            module.Comp.Reply(chain=[module.Comp.Image(str(second_image))])
+        ]
+        release_resolution.set()
+        first_notice = await first_request
+        second_notice = await plugin.generate_image(
+            event, "蓝色帆船穿过海湾，清晨薄雾"
+        )
+
+        assert "任务标识：#1 / P-" in first_notice
+        assert "任务标识：#2 / P-" in second_notice
+        release.set()
+        await asyncio.gather(*tuple(plugin._background_tasks))
+
+        by_sender = {item["sender_id"]: item for item in captured}
+        assert by_sender["10001"]["origin"] == "qq:GroupMessage:200"
+        assert by_sender["10001"]["prompt"] == "红色列车驶过雪山，电影感构图"
+        assert by_sender["10001"]["quoted"][0][1].endswith(b"first-user")
+        assert "用户甲的红色列车请求" in by_sender["10001"]["reference_prompt"]
+        assert "用户乙的蓝色帆船请求" not in by_sender["10001"]["reference_prompt"]
+        assert by_sender["10002"]["origin"] == "qq:GroupMessage:200"
+        assert by_sender["10002"]["prompt"] == "蓝色帆船穿过海湾，清晨薄雾"
+        assert by_sender["10002"]["quoted"][0][1].endswith(b"second-user")
+        assert {origin for origin, _message in plugin.context.sent} == {
+            "qq:GroupMessage:200"
+        }
+        sent_by_qq = {
+            message.chain[0].qq: message.chain[1].text
+            for _origin, message in plugin.context.sent
+        }
+        assert sent_by_qq == {
+            "10001": " 任务 #1 未完成：模拟完成",
+            "10002": " 任务 #2 未完成：模拟完成",
+        }
 
     asyncio.run(scenario())
 
@@ -660,7 +821,9 @@ def test_draw_command_yields_progress_and_continues_in_background() -> None:
         await task
         assert calls == ["竖图 一只猫"]
         assert options[0]["size"] == "640x1024"
-        assert event.sent == ["生成完成"]
+        assert len(event.sent) == 1
+        assert event.sent[0].chain[0].qq == "2"
+        assert event.sent[0].chain[1].text == " 任务 #1 未完成：生成完成"
         assert plugin._active_jobs == {}
 
     asyncio.run(scenario())

@@ -83,5 +83,8 @@ def test_agent_vitepress_document_tracks_public_capabilities() -> None:
         "portrait_user_qqs",
         "REF-01",
         "唯一参考图",
+        "任务隔离",
+        "提示词哈希",
+        "不可变字节快照",
     ):
         assert capability in document

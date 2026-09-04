@@ -4,13 +4,14 @@ import asyncio
 import hashlib
 import re
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star
 from astrbot.core.star.filter.command import GreedyStr
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
@@ -85,6 +86,58 @@ class ActiveGenerationJob:
     stage: str = "等待调度"
     finalized: bool = False
     history_persisted: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class FrozenGenerationEvent:
+    """Generation context captured before any asynchronous request processing."""
+
+    platform_name: str
+    sender_id: str
+    sender_name: str
+    group_id: str | None
+    unified_msg_origin: str
+    admin: bool
+    message_text: str
+    message_components: tuple[Any, ...]
+    self_id: str
+    bot: Any
+    _sender: Callable[[MessageChain], Awaitable[Any]]
+
+    def get_platform_name(self) -> str:
+        return self.platform_name
+
+    def get_sender_id(self) -> str:
+        return self.sender_id
+
+    def get_sender_name(self) -> str:
+        return self.sender_name
+
+    def get_group_id(self) -> str | None:
+        return self.group_id
+
+    def get_message_str(self) -> str:
+        return self.message_text
+
+    def get_messages(self) -> tuple[Any, ...]:
+        return self.message_components
+
+    def get_self_id(self) -> str:
+        return self.self_id
+
+    def is_admin(self) -> bool:
+        return self.admin
+
+    @staticmethod
+    def plain_result(message: str) -> MessageChain:
+        return MessageChain([Comp.Plain(str(message))])
+
+    @staticmethod
+    def chain_result(parts: list[Any]) -> MessageChain:
+        return MessageChain(list(parts))
+
+    async def send(self, message: MessageChain) -> None:
+        await self._sender(message)
 
 
 class GPTImageGeneratorPlugin(Star):
@@ -289,6 +342,76 @@ class GPTImageGeneratorPlugin(Star):
             parts.append(Comp.Plain(text))
         parts.append(Comp.Image.fromFileSystem(str(image_path)))
         return event.chain_result(parts)
+
+    def _freeze_generation_event(
+        self, event: AstrMessageEvent
+    ) -> FrozenGenerationEvent:
+        """Capture task ownership and route before the mutable event can change."""
+
+        def read(method_name: str, default: str = "") -> str:
+            getter = getattr(event, method_name, None)
+            if not callable(getter):
+                return default
+            try:
+                return str(getter() or default)
+            except Exception:
+                return default
+
+        platform_name = read("get_platform_name", "unknown")
+        sender_id = read("get_sender_id")
+        sender_name = read("get_sender_name", sender_id) or sender_id
+        group_id = read("get_group_id") or None
+        unified_msg_origin = str(
+            getattr(event, "unified_msg_origin", "") or ""
+        ).strip()
+        admin = self._event_is_admin(event)
+        bot = getattr(event, "bot", None)
+        message_text = self._event_message_text(event)
+        message_getter = getattr(event, "get_messages", None)
+        try:
+            message_chain = (
+                message_getter()
+                if callable(message_getter)
+                else getattr(getattr(event, "message_obj", None), "message", ())
+            )
+        except Exception:
+            message_chain = ()
+        self_id = read("get_self_id")
+        if not self_id:
+            self_id = str(
+                getattr(getattr(event, "message_obj", None), "self_id", "")
+                or getattr(bot, "self_id", "")
+                or ""
+            )
+
+        context = getattr(self, "context", None)
+        context_sender = getattr(context, "send_message", None)
+        if unified_msg_origin and callable(context_sender):
+
+            async def send_message(message: MessageChain) -> None:
+                await context_sender(unified_msg_origin, message)
+
+        else:
+            event_sender = getattr(event, "send", None)
+
+            async def send_message(message: MessageChain) -> None:
+                if not callable(event_sender):
+                    raise RuntimeError("message event has no usable sender")
+                await event_sender(message)
+
+        return FrozenGenerationEvent(
+            platform_name=platform_name,
+            sender_id=sender_id,
+            sender_name=sender_name,
+            group_id=group_id,
+            unified_msg_origin=unified_msg_origin,
+            admin=admin,
+            message_text=message_text,
+            message_components=tuple(message_chain or ()),
+            self_id=self_id,
+            bot=bot,
+            _sender=send_message,
+        )
 
     def _register_job(
         self,
@@ -934,7 +1057,7 @@ class GPTImageGeneratorPlugin(Star):
         self,
         event: AstrMessageEvent,
         text: str,
-        requested: list[str] | None,
+        requested: list[str] | tuple[str, ...] | None,
     ) -> tuple[tuple[str, ...], str | None]:
         profile_store = getattr(self, "user_profiles", None)
         if profile_store is None:
@@ -1171,6 +1294,32 @@ class GPTImageGeneratorPlugin(Star):
             filename_prefix="quoted",
         )
 
+    async def _capture_quoted_reference_sources(
+        self, event: AstrMessageEvent | FrozenGenerationEvent
+    ) -> tuple[tuple[str, bytes, str], ...]:
+        """Read quoted images before enqueue so later messages cannot replace them."""
+
+        components = self._quoted_image_components(event)
+        if not components:
+            return ()
+        max_quoted_images = self._int(
+            "references", "max_quoted_images", default=2, minimum=1
+        )
+        if len(components) > max_quoted_images:
+            raise ImageGeneratorError(
+                f"单次最多使用 {max_quoted_images} 张引用消息图片，"
+                "请减少引用图片数量后重试。"
+            )
+        total_limit = int(
+            getattr(getattr(self, "references", None), "max_total_images", 4)
+        )
+        if len(components) > total_limit:
+            raise ImageGeneratorError(
+                f"引用消息中有 {len(components)} 张图片，"
+                f"超过单次参考图上限 {total_limit} 张。"
+            )
+        return tuple(await self._load_quoted_image_sources(components))
+
     @staticmethod
     def _augment_quoted_reference_prompt(
         prompt: str,
@@ -1350,14 +1499,15 @@ class GPTImageGeneratorPlugin(Star):
 
     async def _run_background_generation(
         self,
-        event: AstrMessageEvent,
+        event: FrozenGenerationEvent,
         prompt: str,
         *,
         size: str,
         quality: str | None,
-        characters: list[str] | None,
+        characters: tuple[str, ...],
         portrait_user_qqs: tuple[str, ...] = (),
         reference_prompt: str = "",
+        quoted_image_sources: tuple[tuple[str, bytes, str], ...] = (),
         job_id: int,
         started_at: float,
     ) -> None:
@@ -1370,6 +1520,7 @@ class GPTImageGeneratorPlugin(Star):
                 characters=characters,
                 portrait_user_qqs=portrait_user_qqs,
                 reference_prompt=reference_prompt,
+                quoted_image_sources=quoted_image_sources,
                 started_at=started_at,
                 job_id=job_id,
             )
@@ -1389,7 +1540,11 @@ class GPTImageGeneratorPlugin(Star):
                     result_message="图片已生成并发送。",
                 )
             if message:
-                await event.send(event.plain_result(message))
+                await event.send(
+                    self._mention_chain(
+                        event, f" 任务 #{job_id} 未完成：{message}"
+                    )
+                )
         except asyncio.CancelledError:
             self._finalize_job(
                 job_id,
@@ -1404,12 +1559,12 @@ class GPTImageGeneratorPlugin(Star):
                 job_id,
                 status="failed",
                 stage="后台任务异常",
-                result_message="后台生图任务异常终止，请联系管理员查看日志。",
+                result_message=f"任务 #{job_id} 后台异常终止。",
             )
             try:
                 await event.send(
-                    event.plain_result(
-                        "后台生图任务异常终止，请联系管理员查看日志。"
+                    self._mention_chain(
+                        event, f" 任务 #{job_id} 后台异常终止，请联系管理员查看日志。"
                     )
                 )
             except Exception:
@@ -1421,14 +1576,15 @@ class GPTImageGeneratorPlugin(Star):
 
     def _start_background_generation(
         self,
-        event: AstrMessageEvent,
+        event: FrozenGenerationEvent,
         prompt: str,
         *,
         size: str,
         quality: str | None,
-        characters: list[str] | None,
+        characters: list[str] | tuple[str, ...] | None,
         portrait_user_qqs: tuple[str, ...] = (),
         reference_prompt: str = "",
+        quoted_image_sources: tuple[tuple[str, bytes, str], ...] = (),
         source: str,
     ) -> int:
         job_id, started_at = self._register_job(
@@ -1445,13 +1601,14 @@ class GPTImageGeneratorPlugin(Star):
                     prompt,
                     size=size,
                     quality=quality,
-                    characters=characters,
+                    characters=tuple(characters or ()),
                     portrait_user_qqs=portrait_user_qqs,
                     reference_prompt=reference_prompt,
+                    quoted_image_sources=quoted_image_sources,
                     job_id=job_id,
                     started_at=started_at,
                 ),
-                name=f"{PLUGIN_NAME}:generate_image",
+                name=f"{PLUGIN_NAME}:job:{job_id}:qq:{event.get_sender_id()}",
             )
         except Exception:
             self._finalize_job(
@@ -1466,7 +1623,14 @@ class GPTImageGeneratorPlugin(Star):
         task.add_done_callback(self._background_tasks.discard)
         return job_id
 
-    async def _start_notice(self, event: AstrMessageEvent, size: str) -> str:
+    async def _start_notice(
+        self,
+        event: AstrMessageEvent | FrozenGenerationEvent,
+        size: str,
+        *,
+        job_id: int,
+        prompt: str,
+    ) -> str:
         user_id, group_id = self._identity(event)
         pool = self._active_job_snapshot(user_id, group_id)
         try:
@@ -1480,8 +1644,10 @@ class GPTImageGeneratorPlugin(Star):
         queue_line = f"当前队列：全局 {pool['global']} 个、你的 {pool['user']} 个"
         if group_id:
             queue_line += f"、本群 {pool['group']} 个"
+        prompt_digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:10]
         lines = [
             self._generation_start_message(size),
+            f"任务标识：#{job_id} / P-{prompt_digest}（仅对应本次发起消息）",
             queue_line,
             concurrency,
             (
@@ -1569,14 +1735,15 @@ class GPTImageGeneratorPlugin(Star):
 
     async def _generate_image(
         self,
-        event: AstrMessageEvent,
+        event: AstrMessageEvent | FrozenGenerationEvent,
         prompt: str,
         *,
         size: str | None = None,
         quality: str | None = None,
-        characters: list[str] | None = None,
+        characters: list[str] | tuple[str, ...] | None = None,
         portrait_user_qqs: tuple[str, ...] = (),
         reference_prompt: str = "",
+        quoted_image_sources: tuple[tuple[str, bytes, str], ...] | None = None,
         started_at: float | None = None,
         job_id: int | None = None,
     ) -> str | None:
@@ -1594,15 +1761,16 @@ class GPTImageGeneratorPlugin(Star):
         except ImageGeneratorError as exc:
             return exc.public_message
 
-        quoted_components = self._quoted_image_components(event)
-        max_quoted_images = self._int(
-            "references", "max_quoted_images", default=2, minimum=1
-        )
-        if len(quoted_components) > max_quoted_images:
-            return (
-                f"单次最多使用 {max_quoted_images} 张引用消息图片，"
-                "请减少引用图片数量后重试。"
-            )
+        if quoted_image_sources is None:
+            try:
+                raw_quoted_sources = list(
+                    await self._capture_quoted_reference_sources(event)
+                )
+            except ImageGeneratorError as exc:
+                return exc.public_message
+        else:
+            raw_quoted_sources = list(quoted_image_sources)
+
         profile_store = getattr(self, "user_profiles", None)
         profile_references = (
             profile_store.character_references(portrait_user_qqs)
@@ -1611,16 +1779,16 @@ class GPTImageGeneratorPlugin(Star):
         )
         reference_manager = self.references.with_characters(profile_references)
         total_reference_limit = reference_manager.max_total_images
-        if len(quoted_components) > total_reference_limit:
+        if len(raw_quoted_sources) > total_reference_limit:
             return (
-                f"引用消息中有 {len(quoted_components)} 张图片，超过单次参考图上限 "
+                f"引用消息中有 {len(raw_quoted_sources)} 张图片，超过单次参考图上限 "
                 f"{total_reference_limit} 张。"
             )
         requested_characters = [*list(characters or ()), *portrait_user_qqs]
         resolved = reference_manager.resolve(
             "\n".join(item for item in (reference_prompt, raw_prompt) if item),
             requested_characters or None,
-            max_total_images=total_reference_limit - len(quoted_components),
+            max_total_images=total_reference_limit - len(raw_quoted_sources),
         )
         reference_error = self._reference_resolution_error(
             resolved,
@@ -1642,10 +1810,7 @@ class GPTImageGeneratorPlugin(Star):
 
         lease_active = True
         try:
-            self._set_job_stage(job_id, "读取引用图片")
-            raw_quoted_sources = await self._load_quoted_image_sources(
-                quoted_components
-            )
+            self._set_job_stage(job_id, "组装任务专属参考图")
             configured_sources = OpenAICompatibleImageClient.source_from_paths(
                 resolved.image_paths,
                 labels=resolved.image_character_names,
@@ -1811,8 +1976,13 @@ class GPTImageGeneratorPlugin(Star):
                 archive_parts.append("图库归档失败，请联系管理员")
             archive_text = "；" + "；".join(archive_parts) if archive_parts else ""
             duration = self._format_duration(duration_seconds)
+            prompt_digest = hashlib.sha256(
+                raw_prompt.encode("utf-8")
+            ).hexdigest()[:10]
+            task_marker = f"#{job_id}" if job_id is not None else "#未记录"
             caption = (
-                f" 图片已生成（{selected_size}，{selected_quality}）"
+                f" 任务标识：{task_marker} / P-{prompt_digest}。"
+                f"图片已生成（{selected_size}，{selected_quality}）"
                 f"{reference_text}{archive_text}。总用时：{duration}。\n"
                 f"提示词：{raw_prompt}"
             )
@@ -1847,7 +2017,12 @@ class GPTImageGeneratorPlugin(Star):
             )
             if evaluation:
                 try:
-                    await event.send(self._mention_chain(event, f" {evaluation}"))
+                    task_marker = f"#{job_id}" if job_id is not None else "#未记录"
+                    await event.send(
+                        self._mention_chain(
+                            event, f" 任务 {task_marker} 评价：{evaluation}"
+                        )
+                    )
                 except Exception as exc:
                     logger.warning(
                         "[img_gener] failed to send evaluation: %s", str(exc)[:500]
@@ -1992,6 +2167,12 @@ class GPTImageGeneratorPlugin(Star):
         request with queue information. If it returns rejection, no active task,
         or numbered identity candidates, relay that result and do NOT say generating.
 
+        In a busy group chat, one call belongs only to the sender and message that
+        triggered this tool invocation. Never merge another member's recent request,
+        prompt, quoted image, or portrait subject into this call. The accepted result
+        contains a task number and prompt hash; relay that marker unchanged so later
+        image, failure, and evaluation messages can be matched to the same request.
+
         If the user asks about progress, queue state, failures, history, remaining
         quota, or cooldown instead of requesting a new image, do not guess and do
         not call this generation tool. Call get_image_generation_status instead.
@@ -2004,9 +2185,14 @@ class GPTImageGeneratorPlugin(Star):
             portrait_user_qqs(array): QQ portrait subjects; use ["self"] for the
                 requester or explicit QQ numbers after @/alias confirmation.
         """  # noqa: E501
-        if not self._is_allowed(event):
+        frozen_event = self._freeze_generation_event(event)
+        frozen_characters = tuple(str(item) for item in characters or ())
+        frozen_portrait_requests = tuple(
+            str(item) for item in portrait_user_qqs or ()
+        )
+        if not self._is_allowed(frozen_event):
             return "生图功能未启用，或当前用户/群没有使用权限。"
-        original_message = self._event_message_text(event)
+        original_message = frozen_event.get_message_str()
         effective_prompt, reference_prompt = self._effective_tool_prompt(
             prompt, original_message
         )
@@ -2018,7 +2204,7 @@ class GPTImageGeneratorPlugin(Star):
                 "generate_image；不要传入英文提示词，也不要直接复制用户原话。"
             )
             return self._record_rejected_attempt(
-                event,
+                frozen_event,
                 source="LLM",
                 prompt=effective_prompt,
                 size=str(size or DEFAULT_IMAGE_SIZE),
@@ -2030,7 +2216,7 @@ class GPTImageGeneratorPlugin(Star):
             selected_size = self._normalize_size(size)
         except ImageGeneratorError as exc:
             return self._record_rejected_attempt(
-                event,
+                frozen_event,
                 source="LLM",
                 prompt=effective_prompt,
                 size=str(size or DEFAULT_IMAGE_SIZE),
@@ -2039,13 +2225,13 @@ class GPTImageGeneratorPlugin(Star):
                 message=exc.public_message,
             )
         portrait_subjects, portrait_error = await self._resolve_portrait_subjects(
-            event,
+            frozen_event,
             "\n".join(item for item in (reference_prompt, effective_prompt) if item),
-            portrait_user_qqs,
+            frozen_portrait_requests,
         )
         if portrait_error:
             return self._record_rejected_attempt(
-                event,
+                frozen_event,
                 source="LLM",
                 prompt=effective_prompt,
                 size=selected_size,
@@ -2053,10 +2239,12 @@ class GPTImageGeneratorPlugin(Star):
                 stage="人物身份待确认",
                 message=portrait_error,
             )
-        local_rejection = await self._preflight_local_review(event, effective_prompt)
+        local_rejection = await self._preflight_local_review(
+            frozen_event, effective_prompt
+        )
         if local_rejection:
             return self._record_rejected_attempt(
-                event,
+                frozen_event,
                 source="LLM",
                 prompt=effective_prompt,
                 size=selected_size,
@@ -2064,29 +2252,50 @@ class GPTImageGeneratorPlugin(Star):
                 stage="入队前审核或限流拒绝",
                 message=local_rejection,
             )
-        self._start_background_generation(
-            event,
+        try:
+            quoted_sources = await self._capture_quoted_reference_sources(
+                frozen_event
+            )
+        except ImageGeneratorError as exc:
+            return self._record_rejected_attempt(
+                frozen_event,
+                source="LLM",
+                prompt=effective_prompt,
+                size=selected_size,
+                quality=quality,
+                stage="引用图片读取失败",
+                message=exc.public_message,
+            )
+        job_id = self._start_background_generation(
+            frozen_event,
             effective_prompt,
             size=selected_size,
             quality=quality,
-            characters=characters,
+            characters=frozen_characters,
             portrait_user_qqs=portrait_subjects,
             reference_prompt=reference_prompt,
+            quoted_image_sources=quoted_sources,
             source="LLM",
         )
-        return await self._start_notice(event, selected_size)
+        return await self._start_notice(
+            frozen_event,
+            selected_size,
+            job_id=job_id,
+            prompt=effective_prompt,
+        )
 
     @filter.command("生图", alias={"绘图", "draw"})
     async def draw_command(self, event: AstrMessageEvent, prompt: GreedyStr):
         """直接测试 GPT Image 2 生图；正常聊天也可由 LLM 自动调用。"""
 
         event.stop_event()
+        frozen_event = self._freeze_generation_event(event)
         raw_prompt = str(prompt or "").strip()
         try:
             selected_size = self._normalize_size(None)
         except ImageGeneratorError as exc:
             message = self._record_rejected_attempt(
-                event,
+                frozen_event,
                 source="/生图",
                 prompt=raw_prompt,
                 size=DEFAULT_IMAGE_SIZE,
@@ -2096,7 +2305,7 @@ class GPTImageGeneratorPlugin(Star):
             )
             yield event.plain_result(message)
             return
-        if not self._is_allowed(event):
+        if not self._is_allowed(frozen_event):
             yield event.plain_result(
                 "生图功能未启用，或当前用户/群没有使用权限。"
             )
@@ -2105,11 +2314,11 @@ class GPTImageGeneratorPlugin(Star):
             yield event.plain_result("请提供需要生成的画面描述。")
             return
         portrait_subjects, portrait_error = await self._resolve_portrait_subjects(
-            event, raw_prompt, None
+            frozen_event, raw_prompt, None
         )
         if portrait_error:
             message = self._record_rejected_attempt(
-                event,
+                frozen_event,
                 source="/生图",
                 prompt=raw_prompt,
                 size=selected_size,
@@ -2119,10 +2328,12 @@ class GPTImageGeneratorPlugin(Star):
             )
             yield event.plain_result(message)
             return
-        local_rejection = await self._preflight_local_review(event, raw_prompt)
+        local_rejection = await self._preflight_local_review(
+            frozen_event, raw_prompt
+        )
         if local_rejection:
             message = self._record_rejected_attempt(
-                event,
+                frozen_event,
                 source="/生图",
                 prompt=raw_prompt,
                 size=selected_size,
@@ -2132,16 +2343,40 @@ class GPTImageGeneratorPlugin(Star):
             )
             yield event.plain_result(message)
             return
-        self._start_background_generation(
-            event,
+        try:
+            quoted_sources = await self._capture_quoted_reference_sources(
+                frozen_event
+            )
+        except ImageGeneratorError as exc:
+            message = self._record_rejected_attempt(
+                frozen_event,
+                source="/生图",
+                prompt=raw_prompt,
+                size=selected_size,
+                quality=None,
+                stage="引用图片读取失败",
+                message=exc.public_message,
+            )
+            yield event.plain_result(message)
+            return
+        job_id = self._start_background_generation(
+            frozen_event,
             raw_prompt,
             size=selected_size,
             quality=None,
             characters=None,
             portrait_user_qqs=portrait_subjects,
+            quoted_image_sources=quoted_sources,
             source="/生图",
         )
-        yield event.plain_result(await self._start_notice(event, selected_size))
+        yield event.plain_result(
+            await self._start_notice(
+                frozen_event,
+                selected_size,
+                job_id=job_id,
+                prompt=raw_prompt,
+            )
+        )
 
     @filter.command("生图参考图", alias={"本体参考图", "画像参考图"})
     async def portrait_reference_command(
