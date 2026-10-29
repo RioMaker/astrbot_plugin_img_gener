@@ -3,9 +3,11 @@ from __future__ import annotations
 import sqlite3
 import time
 import uuid
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 
+from .gallery_selection import MAX_GALLERY_IMAGES, MAX_SQLITE_INTEGER
 
 ALLOWED_GALLERY_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 
@@ -185,6 +187,56 @@ class GalleryStore:
                 (int(image_id),),
             ).fetchone()
         return self._record(row)
+
+    def recent_for_requester(
+        self, requester_qq: str, *, offset: int = 0, limit: int = MAX_GALLERY_IMAGES
+    ) -> tuple[int, tuple[GalleryImage, ...]]:
+        """Read a person's archive count and page from one consistent snapshot."""
+
+        offset = int(offset)
+        if not 0 <= offset <= MAX_SQLITE_INTEGER:
+            raise ValueError("gallery offset must be a nonnegative SQLite integer")
+        bounded = max(1, min(MAX_GALLERY_IMAGES, int(limit)))
+        requester = self._compact(requester_qq, 64)
+        with closing(self._connect()) as connection, connection:
+            connection.execute("BEGIN")
+            count_row = connection.execute(
+                "SELECT COUNT(*) AS count FROM gallery_images WHERE requester_qq = ?",
+                (requester,),
+            ).fetchone()
+            rows = connection.execute(
+                """
+                SELECT * FROM gallery_images
+                WHERE requester_qq = ?
+                ORDER BY image_id DESC LIMIT ? OFFSET ?
+                """,
+                (requester, bounded, offset),
+            ).fetchall()
+        total = int(count_row["count"] if count_row else 0)
+        records = tuple(record for row in rows if (record := self._record(row)) is not None)
+        return total, records
+
+    def get_many(self, image_ids: tuple[int, ...]) -> tuple[GalleryImage, ...]:
+        """Read global archive IDs in caller order, preserving repeated IDs."""
+
+        if len(image_ids) > MAX_GALLERY_IMAGES:
+            raise ValueError(f"at most {MAX_GALLERY_IMAGES} gallery IDs may be queried")
+        if not image_ids:
+            return ()
+        selected = tuple(int(image_id) for image_id in image_ids)
+        if any(not 1 <= image_id <= MAX_SQLITE_INTEGER for image_id in selected):
+            raise ValueError("gallery IDs must be positive SQLite integers")
+        unique_ids = tuple(dict.fromkeys(selected))
+        placeholders = ",".join("?" for _ in unique_ids)
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                f"SELECT * FROM gallery_images WHERE image_id IN ({placeholders})",
+                unique_ids,
+            ).fetchall()
+        records = {
+            record.image_id: record for row in rows if (record := self._record(row)) is not None
+        }
+        return tuple(records[image_id] for image_id in selected if image_id in records)
 
     def random(self, limit: int = 1) -> tuple[GalleryImage, ...]:
         bounded = max(1, min(9, int(limit)))

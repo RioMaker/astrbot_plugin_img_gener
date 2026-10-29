@@ -1,0 +1,14 @@
+Noto Sans SC Regular (unmodified official Simplified Chinese subset)
+Copyright (c) 2014-2021 Adobe (http://www.adobe.com/).
+Font version: 2.004
+
+Source repository: https://github.com/notofonts/noto-cjk
+Font download: https://raw.githubusercontent.com/notofonts/noto-cjk/main/Sans/SubsetOTF/SC/NotoSansSC-Regular.otf
+License download: https://raw.githubusercontent.com/notofonts/noto-cjk/main/Sans/LICENSE
+Retrieved: 2026-10-29
+SHA-256: faa6c9df652116dde789d351359f3d7e5d2285a2b2a1f04a2d7244df706d5ea9
+
+Distributed under the SIL Open Font License 1.1; see OFL.txt.
+Copyright and font version information are retained in the original font metadata.
+This font is bundled for deterministic Chinese and Japanese kana rendering on
+servers without a system CJK font. The plugin does not fetch fonts at runtime.

@@ -30,6 +30,8 @@ try:
     from .contact_sheet import build_contact_sheet_from_sources, build_gallery_grid
     from .errors import ConfigurationError, ImageGeneratorError
     from .gallery import GalleryImage, GalleryStore
+    from .gallery_render import build_personal_gallery
+    from .gallery_selection import MAX_GALLERY_IMAGES, parse_gallery_request
     from .generation_history import GenerationHistoryRecord, GenerationHistoryStore
     from .image_client import OpenAICompatibleImageClient
     from .moderation import PromptModerator
@@ -50,6 +52,8 @@ except ImportError:  # pragma: no cover - direct script-style import fallback.
     from contact_sheet import build_contact_sheet_from_sources, build_gallery_grid
     from errors import ConfigurationError, ImageGeneratorError
     from gallery import GalleryImage, GalleryStore
+    from gallery_render import build_personal_gallery
+    from gallery_selection import MAX_GALLERY_IMAGES, parse_gallery_request
     from generation_history import GenerationHistoryRecord, GenerationHistoryStore
     from image_client import OpenAICompatibleImageClient
     from moderation import PromptModerator
@@ -194,6 +198,7 @@ class GPTImageGeneratorPlugin(Star):
         )
         self._recovered_history_jobs = self.history_store.recover_unfinished()
         self.gallery_store = GalleryStore(self.data_dir / "gallery")
+        self._gallery_render_lock = asyncio.Lock()
         self.user_profiles = UserProfileStore(
             self.data_dir / "user_profiles.sqlite3"
         )
@@ -2522,6 +2527,103 @@ class GPTImageGeneratorPlugin(Star):
         )
         yield event.plain_result(report)
 
+    @filter.command("画廊")
+    async def gallery_command(self, event: AstrMessageEvent, query: GreedyStr = ""):
+        """将本人最近图片或方括号内指定图库编号拼成个人画廊。"""
+
+        event.stop_event()
+        try:
+            request = parse_gallery_request(str(query or ""))
+        except ImageGeneratorError as exc:
+            yield event.plain_result(exc.public_message)
+            return
+        gallery_store = getattr(self, "gallery_store", None)
+        if gallery_store is None:
+            yield event.plain_result("长期图库尚未初始化。")
+            return
+
+        # Capture the caller before querying or rendering in worker threads.
+        requester_qq = UserProfileStore.normalize_qq(str(event.get_sender_id() or ""))
+        name_getter = getattr(event, "get_sender_name", None)
+        user_name = str(name_getter() or "") if callable(name_getter) else ""
+        user_name = user_name.strip() or requester_qq or "未知用户"
+        next_command = None
+        try:
+            if request.image_ids:
+                records = await asyncio.to_thread(gallery_store.get_many, request.image_ids)
+                found = {record.image_id for record in records}
+                missing = tuple(
+                    dict.fromkeys(
+                        image_id for image_id in request.image_ids if image_id not in found
+                    )
+                )
+                if missing:
+                    yield event.plain_result(
+                        "图库中不存在编号："
+                        + "、".join(map(str, missing))
+                        + "。请修正方括号内的编号后重试。"
+                    )
+                    return
+                subtitle = f"指定图片 · 共 {len(records)} 张 · 按输入顺序排列"
+                command = "/画廊 [" + " ".join(map(str, request.image_ids)) + "]"
+            else:
+                if not requester_qq:
+                    yield event.plain_result("无法识别当前用户，暂时不能查询个人画廊。")
+                    return
+                total, records = await asyncio.to_thread(
+                    gallery_store.recent_for_requester,
+                    requester_qq,
+                    offset=request.start_rank - 1,
+                    limit=request.count,
+                )
+                if total == 0:
+                    yield event.plain_result("你还没有成功归档的图片，先用 /生图 创建一张吧。")
+                    return
+                if not records:
+                    yield event.plain_result(
+                        f"你共保存了 {total} 张图片，起始位置 {request.start_rank} 超出范围。"
+                    )
+                    return
+                end_rank = request.start_rank + len(records) - 1
+                subtitle = f"最近第 {request.start_rank}—{end_rank} 张 · 共 {total} 张"
+                if request.start_rank != 1:
+                    command = f"/画廊 -{request.start_rank}"
+                elif request.count != MAX_GALLERY_IMAGES:
+                    command = f"/画廊 {request.count}"
+                else:
+                    command = "/画廊"
+                if end_rank < total:
+                    next_command = f"/画廊 -{end_rank + 1}"
+        except Exception:
+            logger.exception("[img_gener] failed to query personal gallery")
+            yield event.plain_result("查询画廊失败，请联系管理员查看日志。")
+            return
+
+        try:
+            # Serialize large collages without occupying the event loop or generation quota.
+            async with self._gallery_render_lock:
+                sheet = await asyncio.to_thread(
+                    build_personal_gallery,
+                    records,
+                    user_name=user_name,
+                    subtitle=subtitle,
+                    command=command,
+                    next_command=next_command,
+                    show_latest=not request.image_ids and request.start_rank == 1,
+                )
+                suffix = ".jpg" if sheet.media_type == "image/jpeg" else ".png"
+                image_path = await asyncio.to_thread(
+                    self.output_store.save_bytes, sheet.content, suffix
+                )
+        except ImageGeneratorError as exc:
+            yield event.plain_result(exc.public_message)
+            return
+        except Exception:
+            logger.exception("[img_gener] failed to render personal gallery")
+            yield event.plain_result("画廊拼图保存失败，请联系管理员查看日志。")
+            return
+        yield event.chain_result([Comp.Image.fromFileSystem(str(image_path))])
+
     @filter.command("生图历史", alias={"生图记录"})
     async def history_command(self, event: AstrMessageEvent, query: GreedyStr):
         """查看永久图库总量、指定编号详情，或随机图片拼图。"""
@@ -2545,7 +2647,9 @@ class GPTImageGeneratorPlugin(Star):
                 "图片编号按成功归档顺序自增：1、2、3……\n"
                 "查看详情：/生图历史 <图片编号>\n"
                 "随机单图：/生图历史 随机\n"
-                "随机拼图：/生图历史 随机 <数量>（2～9）"
+                "随机拼图：/生图历史 随机 <数量>（2～9）\n"
+                "个人画廊：/画廊，或 /画廊 10 查看本人最近 10 张\n"
+                "指定选图：/画廊 [123 151 488 622]（方括号必填）"
             )
             return
 
