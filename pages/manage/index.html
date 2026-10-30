@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>生图管理</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <aside>
+        <div class="brand">
+          <span class="brand-icon">▧</span>
+          <div>生图管理<small>GPT IMAGE 2</small></div>
+        </div>
+        <nav aria-label="管理页面">
+          <a href="#history" data-tab="history"><span>▦</span>全部历史</a>
+          <a href="#users" data-tab="users"><span>♙</span>按用户管理</a>
+          <a href="#settings" data-tab="settings"><span>⚙</span>插件设置</a>
+        </nav>
+        <div class="aside-note">
+          ASTRBOT 插件工作台<br />全用户 · 跨群图库<br /><span id="connection"
+            >正在连接管理面板…</span
+          >
+        </div>
+      </aside>
+      <main>
+        <header>
+          <div>
+            <div class="eyebrow">IMAGE WORKSPACE</div>
+            <h1 id="page-title">全部历史</h1>
+            <p id="page-description">按图库编号查看、查询和管理每一张图片。</p>
+          </div>
+          <button id="refresh" class="secondary">刷新数据</button>
+        </header>
+        <div id="notice" role="status" aria-live="polite" hidden></div>
+        <section id="stats" class="stats" aria-label="图库概览"></section>
+        <section id="history-view" hidden>
+          <form id="filters" class="panel filters">
+            <label class="search-field"
+              >关键词<input
+                name="search"
+                placeholder="搜索提示词、昵称或管理备注"
+            /></label>
+            <label
+              >图库编号<input
+                name="image_id"
+                inputmode="numeric"
+                placeholder="例如 128"
+            /></label>
+            <label
+              >用户 QQ<input name="requester_qq" placeholder="全部用户"
+            /></label>
+            <label>群号<input name="group_id" placeholder="全部群聊" /></label>
+            <label>开始日期<input name="date_from" type="date" /></label>
+            <label>结束日期<input name="date_to" type="date" /></label>
+            <label
+              >编号排序<select name="order">
+                <option value="desc">从新到旧 ↓</option>
+                <option value="asc">从旧到新 ↑</option>
+              </select></label
+            >
+            <label
+              >记录范围<select name="deleted">
+                <option value="0">正常图库</option>
+                <option value="1">回收站</option>
+              </select></label
+            >
+            <div class="filter-actions">
+              <button type="submit">查询</button
+              ><button type="reset" class="secondary">重置</button>
+            </div>
+          </form>
+          <div class="list-toolbar">
+            <div>
+              <label class="inline"
+                ><input type="checkbox" id="select-all" />选择本页</label
+              ><span id="result-count"></span>
+            </div>
+            <button id="batch-action" class="danger" disabled>
+              移入回收站
+            </button>
+          </div>
+          <div id="image-list" class="image-grid" aria-live="polite"></div>
+          <div id="image-pagination" class="pagination"></div>
+        </section>
+        <section id="users-view" hidden>
+          <form id="user-filters" class="panel user-search">
+            <label
+              >查找用户<input
+                name="search"
+                placeholder="输入 QQ 或历史昵称" /></label
+            ><button type="submit">查询用户</button>
+          </form>
+          <p class="muted">
+            以用户 QQ 合并跨群图片；显示该用户最近一张图片的昵称。
+          </p>
+          <div id="user-list" class="user-grid" aria-live="polite"></div>
+          <div id="user-pagination" class="pagination"></div>
+        </section>
+        <section id="settings-view" hidden>
+          <div class="panel settings-info">
+            设置保存到 AstrBot
+            插件配置，保存后立即生效。运行中的生图完成后才可保存。密钥仅显示设置状态，留空且未勾选替换时保持原值。
+          </div>
+          <form id="settings-form">
+            <div id="settings-fields"></div>
+            <div class="save-bar">
+              <span id="settings-state">正在读取配置…</span
+              ><button type="submit">保存并应用设置</button>
+            </div>
+          </form>
+        </section>
+        <footer>
+          本页管理永久成功图库；失败、拒绝等任务记录仍通过「生图状态」查询。所有日期均为北京时间。
+        </footer>
+      </main>
+    </div>
+    <dialog id="detail-dialog" aria-labelledby="detail-title">
+      <div class="dialog-heading">
+        <h2 id="detail-title">图片详情</h2>
+        <button class="secondary" id="close-detail" type="button">关闭</button>
+      </div>
+      <div id="detail-body"></div>
+    </dialog>
+    <dialog id="confirm-dialog" aria-labelledby="confirm-title">
+      <h2 id="confirm-title">移入回收站</h2>
+      <p id="confirm-message"></p>
+      <div class="dialog-actions">
+        <button id="cancel-action" class="secondary">取消</button
+        ><button id="confirm-action" class="danger">确认</button>
+      </div>
+    </dialog>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

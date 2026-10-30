@@ -1,8 +1,8 @@
 name: astrbot_plugin_img_gener
 display_name: GPT Image 2 安全生图
-short_desc: 安全调用 GPT Image 2，支持任务隔离、真实状态、QQ 画像、永久图库与个人画廊。
-desc: 通过 UUAPI Images API 提供审核、限流、并发任务隔离、人物/引用图、QQ 单一本体参考图、重名确认，以及按编号或随机拼图访问的永久图库和自适应个人画廊。
-version: "0.1.22"
+short_desc: 安全调用 GPT Image 2，支持永久图库、个人画廊与 AstrBot 内置管理页。
+desc: 通过 UUAPI Images API 提供审核、限流、任务隔离、人物/引用图、QQ 单一本体参考图、永久图库和个人画廊；内置管理页支持全用户历史查询、编辑、回收站与插件配置。
+version: "0.2.0"
 author: Rio
 repo: "https://github.com/RioMaker/astrbot_plugin_img_gener"
 astrbot_version: ">=4.13.0"

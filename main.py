@@ -17,6 +17,7 @@ from astrbot.core.star.filter.command import GreedyStr
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
 try:
+    from .admin_api import register_admin_api
     from .character_references import CharacterReferenceManager, ResolvedReferences
     from .config import (
         as_bool,
@@ -39,6 +40,7 @@ try:
     from .storage import OutputStore
     from .user_profiles import UserProfile, UserProfileStore
 except ImportError:  # pragma: no cover - direct script-style import fallback.
+    from admin_api import register_admin_api
     from character_references import CharacterReferenceManager, ResolvedReferences
     from config import (
         as_bool,
@@ -149,7 +151,7 @@ class GPTImageGeneratorPlugin(Star):
 
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context, config)
-        self.config: dict[str, Any] = config or {}
+        self.config: dict[str, Any] = config if config is not None else {}
         self.plugin_dir = Path(__file__).resolve().parent
         self.data_dir = Path(get_astrbot_plugin_data_path()) / PLUGIN_NAME
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -238,6 +240,7 @@ class GPTImageGeneratorPlugin(Star):
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._active_jobs: dict[int, ActiveGenerationJob] = {}
         self._next_job_id = 0
+        self.admin_api = register_admin_api(self)
 
     async def initialize(self) -> None:
         removed = self.output_store.cleanup()
@@ -260,6 +263,9 @@ class GPTImageGeneratorPlugin(Star):
         )
 
     async def terminate(self) -> None:
+        admin_api = getattr(self, "admin_api", None)
+        if admin_api is not None:
+            admin_api.close()
         tasks = tuple(self._background_tasks)
         for task in tasks:
             task.cancel()

@@ -1,0 +1,14 @@
+{
+  "views": {
+    "manage": {
+      "title": "生图管理",
+      "description": "全用户图库、按用户查询、回收站与插件设置。"
+    }
+  },
+  "pages": {
+    "manage": {
+      "title": "生图管理",
+      "description": "全用户图库、按用户查询、回收站与插件设置。"
+    }
+  }
+}

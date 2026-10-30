@@ -15,7 +15,7 @@
         "type": "string",
         "default": "",
         "obvious_hint": true,
-        "hint": "可直接填写 sk-...，也可填写 $UUAPI_API_KEY 从环境变量读取。不要把真实密钥提交到 Git。"
+        "hint": "可直接填写 sk-...，也可填写 $UUAPI_API_KEY 从环境变量读取。生图管理页不回显密钥，须勾选替换才更改。不要把真实密钥提交到 Git。"
       },
       "model": {
         "description": "生图模型",
@@ -168,7 +168,7 @@
         "type": "string",
         "default": "",
         "obvious_hint": true,
-        "hint": "仅发送给审核 API；可直接填写，也可填写 $UUAPI_REVIEW_API_KEY 从环境变量读取。"
+        "hint": "仅发送给审核 API；可直接填写，也可填写 $UUAPI_REVIEW_API_KEY 从环境变量读取。生图管理页不回显密钥，须勾选替换才更改。"
       },
       "review_model": {
         "description": "UUAPI 审核模型",

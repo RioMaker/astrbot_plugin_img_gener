@@ -26,6 +26,9 @@ class GalleryImage:
     image_path: Path
     created_at: float
     duration_seconds: float
+    admin_note: str = ""
+    revision: int = 0
+    deleted_at: float | None = None
 
 
 class GalleryStore:
@@ -69,6 +72,14 @@ class GalleryStore:
                     ON gallery_images(requester_qq, image_id DESC);
                 """
             )
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(gallery_images)")}
+            for name, definition in (
+                ("admin_note", "TEXT NOT NULL DEFAULT ''"),
+                ("revision", "INTEGER NOT NULL DEFAULT 0"),
+                ("deleted_at", "REAL"),
+            ):
+                if name not in columns:
+                    connection.execute(f"ALTER TABLE gallery_images ADD COLUMN {name} {definition}")
 
     @staticmethod
     def _compact(value: str, limit: int) -> str:
@@ -102,6 +113,9 @@ class GalleryStore:
             image_path=(self.image_dir / str(row["image_filename"])).resolve(),
             created_at=float(row["created_at"]),
             duration_seconds=float(row["duration_seconds"]),
+            admin_note=str(row["admin_note"]),
+            revision=int(row["revision"]),
+            deleted_at=row["deleted_at"],
         )
 
     def add_image(
@@ -176,14 +190,15 @@ class GalleryStore:
     def count(self) -> int:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT COUNT(*) AS count FROM gallery_images"
+                "SELECT COUNT(*) AS count FROM gallery_images WHERE deleted_at IS NULL"
             ).fetchone()
         return int(row["count"] if row else 0)
 
-    def get(self, image_id: int) -> GalleryImage | None:
+    def get(self, image_id: int, *, include_deleted: bool = False) -> GalleryImage | None:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT * FROM gallery_images WHERE image_id = ?",
+                "SELECT * FROM gallery_images WHERE image_id = ?"
+                + ("" if include_deleted else " AND deleted_at IS NULL"),
                 (int(image_id),),
             ).fetchone()
         return self._record(row)
@@ -201,13 +216,14 @@ class GalleryStore:
         with closing(self._connect()) as connection, connection:
             connection.execute("BEGIN")
             count_row = connection.execute(
-                "SELECT COUNT(*) AS count FROM gallery_images WHERE requester_qq = ?",
+                "SELECT COUNT(*) AS count FROM gallery_images "
+                "WHERE requester_qq = ? AND deleted_at IS NULL",
                 (requester,),
             ).fetchone()
             rows = connection.execute(
                 """
                 SELECT * FROM gallery_images
-                WHERE requester_qq = ?
+                WHERE requester_qq = ? AND deleted_at IS NULL
                 ORDER BY image_id DESC LIMIT ? OFFSET ?
                 """,
                 (requester, bounded, offset),
@@ -230,7 +246,8 @@ class GalleryStore:
         placeholders = ",".join("?" for _ in unique_ids)
         with closing(self._connect()) as connection:
             rows = connection.execute(
-                f"SELECT * FROM gallery_images WHERE image_id IN ({placeholders})",
+                f"SELECT * FROM gallery_images WHERE image_id IN ({placeholders}) "
+                "AND deleted_at IS NULL",
                 unique_ids,
             ).fetchall()
         records = {
@@ -242,7 +259,7 @@ class GalleryStore:
         bounded = max(1, min(9, int(limit)))
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM gallery_images ORDER BY RANDOM() LIMIT ?",
+                "SELECT * FROM gallery_images WHERE deleted_at IS NULL ORDER BY RANDOM() LIMIT ?",
                 (bounded,),
             ).fetchall()
         return tuple(record for row in rows if (record := self._record(row)) is not None)
