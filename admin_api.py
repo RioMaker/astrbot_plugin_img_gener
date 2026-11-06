@@ -112,6 +112,18 @@ class AdminAPI:
             with Image.open(path) as original:
                 if original.width * original.height > 40_000_000:
                     raise AdminError("图片像素过大，请下载原图查看。")
+                if record.is_animated:
+                    # CSS scales the original without losing timing or transparency.
+                    if original.format != "GIF":
+                        raise AdminError("GIF 文件格式与记录不符。", 422)
+                    with path.open("rb") as source:
+                        content = source.read(30 * 1024 * 1024 + 1)
+                    if len(content) > 30 * 1024 * 1024:
+                        raise AdminError("GIF 超过 30MB，请下载原图查看。", 413)
+                    return {
+                        "data_url": "data:image/gif;base64,"
+                        + base64.b64encode(content).decode("ascii")
+                    }
                 original.thumbnail((1400, 1400) if large else (400, 400))
                 image = ImageOps.exif_transpose(original).convert("RGB")
                 buffer = io.BytesIO()

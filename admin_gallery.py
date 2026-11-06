@@ -39,6 +39,7 @@ def text_value(value: Any, name: str, limit: int, *, required: bool = False) -> 
 def serialize(record: GalleryImage) -> dict:
     result = asdict(record)
     result.pop("image_path")
+    result["is_animated"] = record.is_animated
     # Local paths are never returned to the browser.
     return result
 
@@ -58,6 +59,13 @@ class AdminGallery:
         if deleted not in {"0", "1"}:
             raise AdminError("回收站参数无效。")
         where = ["deleted_at IS NOT NULL" if deleted == "1" else "deleted_at IS NULL"]
+        media_kind = query.get("media_kind", "all")
+        if media_kind not in {"all", "static", "gif"}:
+            raise AdminError("图片类型只能是 all、static 或 gif。")
+        if media_kind != "all":
+            where.append(
+                "media_type = 'image/gif'" if media_kind == "gif" else "media_type != 'image/gif'"
+            )
         args: list[Any] = []
         for field, length in (("requester_qq", 64), ("group_id", 64)):
             value = text_value(query.get(field, ""), field, length)

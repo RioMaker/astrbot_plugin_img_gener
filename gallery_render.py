@@ -74,6 +74,7 @@ def _image_well(path: Path, size: int):
     well = Image.new("RGB", (size, size), _WELL)
     try:
         with Image.open(path) as source:
+            source.seek(0)
             if source.width * source.height > 40_000_000:
                 raise ValueError("image exceeds gallery decode limit")
             prepared = ImageOps.exif_transpose(source)
@@ -184,6 +185,15 @@ def build_personal_gallery(
         elif show_latest and index == 0:
             draw.rounded_rectangle((x + 14, y + 14, x + 108, y + 56), 16, fill=_TEAL)
             draw.text((x + 34, y + 21), "最新", font=small_font, fill="white", anchor="lt")
+        if record.is_animated:
+            draw.rounded_rectangle(
+                (x + card_width - 90, y + 14, x + card_width - 14, y + 56),
+                12,
+                fill=(79, 70, 229),
+            )
+            draw.text(
+                (x + card_width - 76, y + 21), "GIF", font=small_font, fill="white", anchor="lt"
+            )
         date = _date(record.created_at)
         date_width = date_font.getlength(date)
         label = f"#{record.image_id}"

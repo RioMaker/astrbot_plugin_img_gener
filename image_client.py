@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 import httpx
 
 from .errors import ImageAPIError
+from .gif_support import GifOptions, first_frame_png, validate_gif
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,6 +29,7 @@ class ImageResponse:
             "image/jpeg": ".jpg",
             "image/webp": ".webp",
             "image/png": ".png",
+            "image/gif": ".gif",
         }.get(self.media_type, ".png")
 
 
@@ -51,7 +53,9 @@ class OpenAICompatibleImageClient:
         self.timeout_seconds = max(10.0, timeout_seconds)
         self.max_response_bytes = max(1, max_response_mb) * 1024 * 1024
         self.user_agent = user_agent
-        self.edit_image_field = edit_image_field if edit_image_field in {"image", "image[]"} else "image"  # noqa: E501
+        self.edit_image_field = (
+            edit_image_field if edit_image_field in {"image", "image[]"} else "image"
+        )  # noqa: E501
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -65,9 +69,7 @@ class OpenAICompatibleImageClient:
         return httpx.Timeout(total, connect=min(20.0, total))
 
     @staticmethod
-    def _error_detail(
-        response: httpx.Response, *, operation: str = "", path: str = ""
-    ) -> str:
+    def _error_detail(response: httpx.Response, *, operation: str = "", path: str = "") -> str:
         try:
             payload = response.json()
             error = payload.get("error", payload) if isinstance(payload, dict) else payload
@@ -98,9 +100,7 @@ class OpenAICompatibleImageClient:
         return " ".join(parts)[:1200]
 
     @classmethod
-    def _http_error(
-        cls, response: httpx.Response, *, operation: str, path: str
-    ) -> ImageAPIError:
+    def _http_error(cls, response: httpx.Response, *, operation: str, path: str) -> ImageAPIError:
         status = response.status_code
         detail = cls._error_detail(response, operation=operation, path=path)
         if status in {401, 403}:
@@ -123,9 +123,7 @@ class OpenAICompatibleImageClient:
         timeout: float | None = None,
         operation: str = "生图服务",
     ) -> dict[str, object]:
-        configured_timeout = (
-            self.timeout_seconds if timeout is None else max(5.0, timeout)
-        )
+        configured_timeout = self.timeout_seconds if timeout is None else max(5.0, timeout)
         started = time.monotonic()
         try:
             async with httpx.AsyncClient(
@@ -161,7 +159,9 @@ class OpenAICompatibleImageClient:
             raise ImageAPIError(f"{operation}返回格式不正确。")
         return data
 
-    async def generate(self, prompt: str, *, size: str, quality: str) -> ImageResponse:
+    async def generate(
+        self, prompt: str, *, size: str, quality: str, animation: GifOptions | None = None
+    ) -> ImageResponse:
         payload: dict[str, object] = {
             "model": self.model,
             "prompt": prompt,
@@ -171,8 +171,13 @@ class OpenAICompatibleImageClient:
         }
         if quality:
             payload["quality"] = quality
+        if animation is not None:
+            payload.update(animation.request_fields())
         data = await self._post_json("/images/generations", payload)
-        return await self._parse_image_response(data)
+        result = await self._parse_image_response(data)
+        if animation is not None:
+            validate_gif(result.content)
+        return result
 
     @staticmethod
     def _safe_reference_label(label: str) -> str:
@@ -189,8 +194,12 @@ class OpenAICompatibleImageClient:
     ) -> list[tuple[str, bytes, str]]:
         sources: list[tuple[str, bytes, str]] = []
         for index, path in enumerate(paths, start=1):
+            content = path.read_bytes()
             media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
             suffix = Path(path.name).suffix.lower()
+            if content.startswith((b"GIF87a", b"GIF89a")):
+                content = first_frame_png(content)
+                media_type, suffix = "image/png", ".png"
             if suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
                 suffix = ".png"
             if index <= len(labels):
@@ -200,7 +209,7 @@ class OpenAICompatibleImageClient:
                 # Preserve the legacy generic name for callers that do not
                 # provide an explicit image-to-character mapping.
                 filename = f"reference_{index}{suffix}"
-            sources.append((filename, path.read_bytes(), media_type))
+            sources.append((filename, content, media_type))
         return sources
 
     async def edit(
@@ -210,11 +219,12 @@ class OpenAICompatibleImageClient:
         *,
         size: str,
         quality: str,
+        animation: GifOptions | None = None,
     ) -> ImageResponse:
         """Edit with in-memory image sources: (filename, content, media_type)."""
 
         if not sources:
-            return await self.generate(prompt, size=size, quality=quality)
+            return await self.generate(prompt, size=size, quality=quality, animation=animation)
         form_data: dict[str, str] = {
             "model": self.model,
             "prompt": prompt,
@@ -223,6 +233,8 @@ class OpenAICompatibleImageClient:
         }
         if quality:
             form_data["quality"] = quality
+        if animation is not None:
+            form_data.update({key: str(value) for key, value in animation.request_fields().items()})
         files: list[tuple[str, tuple[str, bytes, str]]] = [
             (self.edit_image_field, source) for source in sources
         ]
@@ -261,11 +273,12 @@ class OpenAICompatibleImageClient:
             raise ImageAPIError("参考图生图返回了无法解析的响应。") from exc
         if not isinstance(payload, dict):
             raise ImageAPIError("参考图生图返回格式不正确。")
-        return await self._parse_image_response(payload)
+        result = await self._parse_image_response(payload)
+        if animation is not None:
+            validate_gif(result.content)
+        return result
 
-    async def chat_completion(
-        self, model: str, prompt: str, *, timeout_seconds: float = 45
-    ) -> str:
+    async def chat_completion(self, model: str, prompt: str, *, timeout_seconds: float = 45) -> str:
         payload = {
             "model": model,
             "stream": False,
@@ -289,9 +302,7 @@ class OpenAICompatibleImageClient:
         *,
         timeout_seconds: float = 60,
     ) -> str:
-        data_url = (
-            f"data:{media_type};base64,{base64.b64encode(image_bytes).decode('ascii')}"
-        )
+        data_url = f"data:{media_type};base64,{base64.b64encode(image_bytes).decode('ascii')}"
         payload = {
             "model": model,
             "stream": False,
@@ -374,9 +385,12 @@ class OpenAICompatibleImageClient:
     async def _download_image(self, url: str) -> tuple[bytes, str]:
         self._validate_download_url(url)
         try:
-            async with httpx.AsyncClient(
-                timeout=self._timeout(min(self.timeout_seconds, 60)), follow_redirects=True
-            ) as client, client.stream("GET", url) as response:
+            async with (
+                httpx.AsyncClient(
+                    timeout=self._timeout(min(self.timeout_seconds, 60)), follow_redirects=True
+                ) as client,
+                client.stream("GET", url) as response,
+            ):
                 response.raise_for_status()
                 chunks: list[bytes] = []
                 total = 0
@@ -404,5 +418,6 @@ class OpenAICompatibleImageClient:
             return "image/jpeg"
         if content.startswith(b"RIFF") and content[8:12] == b"WEBP":
             return "image/webp"
-        raise ImageAPIError("生图服务返回的内容不是支持的 PNG/JPEG/WebP 图片。")
-
+        if content.startswith((b"GIF87a", b"GIF89a")):
+            return "image/gif"
+        raise ImageAPIError("生图服务返回的内容不是支持的 PNG/JPEG/WebP/GIF 图片。")

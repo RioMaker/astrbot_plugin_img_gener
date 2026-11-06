@@ -140,6 +140,53 @@
       }
     }
   },
+  "animation": {
+    "description": "GIF 动图",
+    "type": "object",
+    "hint": "/生动图 使用独立参数，与普通生图共用 API 地址、密钥、审核和额度。UUAPI 一个 GIF 按一张图计费，1K 档以下不保证继续降价。",
+    "items": {
+      "model": {
+        "description": "动图模型",
+        "type": "string",
+        "default": "gpt-image-2.6"
+      },
+      "size": {
+        "description": "每帧尺寸",
+        "type": "string",
+        "default": "512x512",
+        "options": [
+          "512x512",
+          "640x640",
+          "768x768",
+          "1024x1024"
+        ],
+        "hint": "默认 512×512；明确指定小尺寸，避免 auto 按 2K 档计费。较大的尺寸与帧数组合可能触发上游总像素限制。"
+      },
+      "quality": {
+        "description": "动图质量",
+        "type": "string",
+        "default": "low",
+        "options": [
+          "auto",
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      "frame_count": {
+        "description": "帧数",
+        "type": "int",
+        "default": 16,
+        "hint": "2～16 帧。一个 GIF 占用一次生图额度。"
+      },
+      "frame_duration_ms": {
+        "description": "每帧时长（毫秒）",
+        "type": "int",
+        "default": 40,
+        "hint": "20～2000，必须为 10 的倍数。默认一轮约 0.64 秒。"
+      }
+    }
+  },
   "safety": {
     "description": "安全审核",
     "type": "object",

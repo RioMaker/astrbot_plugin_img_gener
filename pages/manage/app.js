@@ -11,6 +11,8 @@ const state = {
   dirty: false,
 };
 const cache = new Map();
+const animated = (record) =>
+  record.is_animated || record.media_type === "image/gif";
 const date = (value) =>
   new Intl.DateTimeFormat("zh-CN", {
     timeZone: "Asia/Shanghai",
@@ -89,7 +91,7 @@ function pagination(target, data, load) {
   );
 }
 async function preview(record, target, large = false) {
-  const key = `${record.image_id}:${record.revision}:${large}`;
+  const key = `${record.image_id}:${record.revision}:${animated(record) ? "gif" : large}`;
   try {
     let data = cache.get(key);
     if (!data) {
@@ -97,17 +99,30 @@ async function preview(record, target, large = false) {
         image_id: record.image_id,
         large: large ? "1" : "0",
       });
-      cache.set(key, data);
-      if (cache.size > 120) cache.delete(cache.keys().next().value);
+      // Bound retained data URLs by bytes as well as entry count; GIFs are larger.
+      if (data.data_url.length <= 24 * 1024 * 1024) cache.set(key, data);
+      while (
+        cache.size > 120 ||
+        [...cache.values()].reduce(
+          (bytes, value) => bytes + value.data_url.length,
+          0,
+        ) >
+          24 * 1024 * 1024
+      ) {
+        cache.delete(cache.keys().next().value);
+      }
     }
     if (!target.isConnected) return;
     const img = el("img");
-    img.alt = `图库 #${record.image_id}`;
+    img.alt = `图库 #${record.image_id}${animated(record) ? " · GIF 动图" : ""}`;
     img.src = data.data_url;
     target.replaceChildren(img);
+    if (animated(record)) target.append(el("span", "gif-badge", "GIF"));
   } catch (error) {
-    if (target.isConnected)
+    if (target.isConnected) {
       target.textContent = error.message || "无法读取图片";
+      if (animated(record)) target.append(el("span", "gif-badge", "GIF"));
+    }
   }
 }
 function selection() {
@@ -285,12 +300,13 @@ $("close-detail").onclick = () => $("detail-dialog").close();
 async function showDetail(id) {
   const record = await api("detail", { image_id: id });
   $("detail-title").textContent =
-    `图库 #${record.image_id}${record.deleted_at ? " · 回收站" : ""}`;
+    `图库 #${record.image_id}${animated(record) ? " · GIF 动图" : ""}${record.deleted_at ? " · 回收站" : ""}`;
   const grid = el("div", "detail-grid"),
     picture = el("div", "detail-preview", "正在读取预览…"),
     form = el("form", "detail-form"),
     info = el("dl", "detail-info");
   for (const [key, value] of [
+    ["图片类型", animated(record) ? "GIF 动图" : "静态图"],
     ["用户 QQ", record.requester_qq],
     ["来源群", record.group_id || "私聊"],
     ["生成时间", date(record.created_at)],

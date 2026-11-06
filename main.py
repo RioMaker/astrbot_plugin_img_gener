@@ -5,6 +5,7 @@ import hashlib
 import re
 import time
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,7 @@ try:
     from .gallery_render import build_personal_gallery
     from .gallery_selection import MAX_GALLERY_IMAGES, parse_gallery_request
     from .generation_history import GenerationHistoryRecord, GenerationHistoryStore
+    from .gif_support import GifOptions, first_frame_png
     from .image_client import OpenAICompatibleImageClient
     from .moderation import PromptModerator
     from .rate_limiter import LimitConfig, PersistentRateLimiter
@@ -57,6 +59,7 @@ except ImportError:  # pragma: no cover - direct script-style import fallback.
     from gallery_render import build_personal_gallery
     from gallery_selection import MAX_GALLERY_IMAGES, parse_gallery_request
     from generation_history import GenerationHistoryRecord, GenerationHistoryStore
+    from gif_support import GifOptions, first_frame_png
     from image_client import OpenAICompatibleImageClient
     from moderation import PromptModerator
     from rate_limiter import LimitConfig, PersistentRateLimiter
@@ -775,10 +778,8 @@ class GPTImageGeneratorPlugin(Star):
             admin_check = getattr(event, "is_admin", None)
             is_admin = False
             if callable(admin_check):
-                try:
+                with suppress(Exception):
                     is_admin = bool(admin_check())
-                except Exception:
-                    pass
             if is_admin and self._bool(
                 "limits", "admins_bypass_limits", default=True
             ):
@@ -903,10 +904,8 @@ class GPTImageGeneratorPlugin(Star):
         self_ids: set[str] = set()
         self_getter = getattr(event, "get_self_id", None)
         if callable(self_getter):
-            try:
+            with suppress(Exception):
                 self_ids.add(str(self_getter() or ""))
-            except Exception:
-                pass
         for source in (
             getattr(event, "message_obj", None),
             raw_message,
@@ -1290,6 +1289,10 @@ class GPTImageGeneratorPlugin(Star):
                     f"{source_label}已失效或无法读取，请重新发送图片后再试。",
                     detail=f"{filename_prefix}={index} error={type(exc).__name__}: {exc}",
                 ) from exc
+            if content.startswith((b"GIF87a", b"GIF89a")):
+                content = await asyncio.to_thread(first_frame_png, content)
+                if len(content) > max_bytes:
+                    raise ImageGeneratorError(f"{source_label}的 GIF 首帧超过图片大小上限。")
             media_type, suffix = self._reference_media_type(
                 content, source_label=source_label
             )
@@ -1521,6 +1524,7 @@ class GPTImageGeneratorPlugin(Star):
         quoted_image_sources: tuple[tuple[str, bytes, str], ...] = (),
         job_id: int,
         started_at: float,
+        animation: GifOptions | None = None,
     ) -> None:
         try:
             message = await self._generate_image(
@@ -1534,6 +1538,7 @@ class GPTImageGeneratorPlugin(Star):
                 quoted_image_sources=quoted_image_sources,
                 started_at=started_at,
                 job_id=job_id,
+                animation=animation,
             )
             job = self._active_jobs.get(job_id)
             if message and (job is None or not job.finalized):
@@ -1597,6 +1602,7 @@ class GPTImageGeneratorPlugin(Star):
         reference_prompt: str = "",
         quoted_image_sources: tuple[tuple[str, bytes, str], ...] = (),
         source: str,
+        animation: GifOptions | None = None,
     ) -> int:
         job_id, started_at = self._register_job(
             event,
@@ -1618,6 +1624,7 @@ class GPTImageGeneratorPlugin(Star):
                     quoted_image_sources=quoted_image_sources,
                     job_id=job_id,
                     started_at=started_at,
+                    animation=animation,
                 ),
                 name=f"{PLUGIN_NAME}:job:{job_id}:qq:{event.get_sender_id()}",
             )
@@ -1688,6 +1695,12 @@ class GPTImageGeneratorPlugin(Star):
             f"实际生图提示词：{prompt}"
         )
         try:
+            if media_type == "image/gif":
+                image_content = await asyncio.to_thread(first_frame_png, image_content)
+                media_type = "image/png"
+                vision_prompt = (
+                    "下面仅为 GIF 首帧，请只评价静态画面，不评价动画效果。\n" + vision_prompt
+                )
             text = await client.chat_completion_vision(
                 vision_model,
                 vision_prompt,
@@ -1757,6 +1770,7 @@ class GPTImageGeneratorPlugin(Star):
         quoted_image_sources: tuple[tuple[str, bytes, str], ...] | None = None,
         started_at: float | None = None,
         job_id: int | None = None,
+        animation: GifOptions | None = None,
     ) -> str | None:
         started_at = time.monotonic() if started_at is None else started_at
         self._set_job_stage(job_id, "检查权限与配额")
@@ -1767,8 +1781,8 @@ class GPTImageGeneratorPlugin(Star):
         if not raw_prompt:
             return "请提供需要生成的画面描述。"
         try:
-            selected_size = self._normalize_size(size)
-            selected_quality = self._normalize_quality(quality)
+            selected_size = animation.size if animation else self._normalize_size(size)
+            selected_quality = animation.quality if animation else self._normalize_quality(quality)
         except ImageGeneratorError as exc:
             return exc.public_message
 
@@ -1927,12 +1941,14 @@ class GPTImageGeneratorPlugin(Star):
                     sources,
                     size=selected_size,
                     quality=selected_quality,
+                    **({"animation": animation} if animation else {}),
                 )
             else:
                 generated = await client.generate(
                     effective_prompt,
                     size=selected_size,
                     quality=selected_quality,
+                    **({"animation": animation} if animation else {}),
                 )
 
             await self.rate_limiter.complete(rate.lease_id)
@@ -1969,7 +1985,7 @@ class GPTImageGeneratorPlugin(Star):
             reference_text = (
                 "；已携带" + "；".join(reference_parts) if reference_parts else ""
             )
-            archive_parts = []
+            archive_parts = ["GIF 动图"] if generated.media_type == "image/gif" else []
             if gallery_record is not None:
                 archive_parts.append(f"图库编号：{gallery_record.image_id}")
                 updated_profiles = tuple(
@@ -2043,7 +2059,11 @@ class GPTImageGeneratorPlugin(Star):
                 status="succeeded",
                 stage="已完成",
                 result_message=(
-                    "图片已生成并发送。"
+                    (
+                        "GIF 动图已生成并发送。"
+                        if generated.media_type == "image/gif"
+                        else "图片已生成并发送。"
+                    )
                     + (
                         f" 图库编号：{gallery_record.image_id}。"
                         if gallery_record is not None
@@ -2296,21 +2316,35 @@ class GPTImageGeneratorPlugin(Star):
         )
 
     @filter.command("生图", alias={"绘图", "draw"})
-    async def draw_command(self, event: AstrMessageEvent, prompt: GreedyStr):
+    async def draw_command(self, event: AstrMessageEvent, prompt: GreedyStr = ""):
         """直接测试 GPT Image 2 生图；正常聊天也可由 LLM 自动调用。"""
 
+        async for result in self._draw_command(event, prompt):
+            yield result
+
+    @filter.command("生动图")
+    async def gif_command(self, event: AstrMessageEvent, prompt: GreedyStr = ""):
+        """用 GPT Image 2.6 生成 GIF 动图，默认 16 帧、40ms、512×512。"""
+
+        async for result in self._draw_command(event, prompt, animated=True):
+            yield result
+
+    async def _draw_command(self, event: AstrMessageEvent, prompt: str, *, animated=False):
         event.stop_event()
         frozen_event = self._freeze_generation_event(event)
         raw_prompt = str(prompt or "").strip()
+        source = "/生动图" if animated else "/生图"
+        animation = None
         try:
-            selected_size = self._normalize_size(None)
+            animation = GifOptions.from_config(self.config) if animated else None
+            selected_size = animation.size if animation else self._normalize_size(None)
         except ImageGeneratorError as exc:
             message = self._record_rejected_attempt(
                 frozen_event,
-                source="/生图",
+                source=source,
                 prompt=raw_prompt,
                 size=DEFAULT_IMAGE_SIZE,
-                quality=None,
+                quality=animation.quality if animation else None,
                 stage="参数校验失败",
                 message=exc.public_message,
             )
@@ -2330,10 +2364,10 @@ class GPTImageGeneratorPlugin(Star):
         if portrait_error:
             message = self._record_rejected_attempt(
                 frozen_event,
-                source="/生图",
+                source=source,
                 prompt=raw_prompt,
                 size=selected_size,
-                quality=None,
+                quality=animation.quality if animation else None,
                 stage="人物身份待确认",
                 message=portrait_error,
             )
@@ -2345,10 +2379,10 @@ class GPTImageGeneratorPlugin(Star):
         if local_rejection:
             message = self._record_rejected_attempt(
                 frozen_event,
-                source="/生图",
+                source=source,
                 prompt=raw_prompt,
                 size=selected_size,
-                quality=None,
+                quality=animation.quality if animation else None,
                 stage="入队前审核或限流拒绝",
                 message=local_rejection,
             )
@@ -2361,10 +2395,10 @@ class GPTImageGeneratorPlugin(Star):
         except ImageGeneratorError as exc:
             message = self._record_rejected_attempt(
                 frozen_event,
-                source="/生图",
+                source=source,
                 prompt=raw_prompt,
                 size=selected_size,
-                quality=None,
+                quality=animation.quality if animation else None,
                 stage="引用图片读取失败",
                 message=exc.public_message,
             )
@@ -2374,11 +2408,12 @@ class GPTImageGeneratorPlugin(Star):
             frozen_event,
             raw_prompt,
             size=selected_size,
-            quality=None,
+            quality=animation.quality if animation else None,
             characters=None,
             portrait_user_qqs=portrait_subjects,
             quoted_image_sources=quoted_sources,
-            source="/生图",
+            source=source,
+            animation=animation,
         )
         yield event.plain_result(
             await self._start_notice(
@@ -2386,6 +2421,11 @@ class GPTImageGeneratorPlugin(Star):
                 selected_size,
                 job_id=job_id,
                 prompt=raw_prompt,
+            )
+            + (
+                f"\nGIF 动图：{animation.frame_count} 帧 · {animation.frame_duration_ms}ms/帧"
+                if animation
+                else ""
             )
         )
 
@@ -2650,7 +2690,7 @@ class GPTImageGeneratorPlugin(Star):
             yield event.plain_result(
                 "🎨 永久生图图库\n"
                 f"当前共保存 {total} 张成功图片。\n"
-                "图片编号按成功归档顺序自增：1、2、3……\n"
+                "静态图与 GIF 共用编号，按成功归档顺序自增：1、2、3……\n"
                 "查看详情：/生图历史 <图片编号>\n"
                 "随机单图：/生图历史 随机\n"
                 "随机拼图：/生图历史 随机 <数量>（2～9）\n"
@@ -2687,7 +2727,12 @@ class GPTImageGeneratorPlugin(Star):
                 return
             if requested_count == 1:
                 yield event.chain_result(
-                    [Comp.Image.fromFileSystem(str(records[0].image_path))]
+                    (
+                        [Comp.Plain(f"图库编号：{records[0].image_id} · GIF 动图\n")]
+                        if records[0].is_animated
+                        else []
+                    )
+                    + [Comp.Image.fromFileSystem(str(records[0].image_path))]
                 )
                 return
             try:
@@ -2732,7 +2777,7 @@ class GPTImageGeneratorPlugin(Star):
         requester = record.requester_name or "未知昵称"
         group_text = record.group_id or "私聊"
         details = (
-            f" 图库编号：{record.image_id}\n"
+            f" 图库编号：{record.image_id}{' · GIF 动图' if record.is_animated else ''}\n"
             f"请求人：{requester}（QQ：{record.requester_qq}）\n"
             f"会话：{group_text}\n"
             f"时间：{created}\n"

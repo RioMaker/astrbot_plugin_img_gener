@@ -563,12 +563,27 @@ dialog::backdrop {
   gap: 26px;
 }
 .detail-preview {
+  position: relative;
   background: var(--bg);
   border-radius: 10px;
   min-height: 260px;
   display: grid;
   place-items: center;
   overflow: hidden;
+}
+.gif-badge {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 1;
+  padding: 5px 8px;
+  border-radius: 6px;
+  background: #4f46e5;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  pointer-events: none;
 }
 .detail-preview img {
   max-width: 100%;

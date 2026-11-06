@@ -8,6 +8,8 @@ from urllib.parse import urlsplit
 
 from .admin_gallery import AdminError
 from .character_references import CharacterReferenceManager
+from .errors import ConfigurationError
+from .gif_support import GifOptions
 from .moderation import PromptModerator
 from .rate_limiter import LimitConfig
 
@@ -152,6 +154,10 @@ class AdminConfig:
             }
             for group, section in self.schema.items()
         }
+        try:
+            GifOptions.from_config(values)
+        except ConfigurationError as exc:
+            raise AdminError(exc.public_message) from exc
         limits = LimitConfig(
             **{
                 key: values["limits"][key]

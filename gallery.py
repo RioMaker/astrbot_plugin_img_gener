@@ -9,7 +9,7 @@ from pathlib import Path
 
 from .gallery_selection import MAX_GALLERY_IMAGES, MAX_SQLITE_INTEGER
 
-ALLOWED_GALLERY_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
+ALLOWED_GALLERY_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +29,10 @@ class GalleryImage:
     admin_note: str = ""
     revision: int = 0
     deleted_at: float | None = None
+
+    @property
+    def is_animated(self) -> bool:
+        return self.media_type == "image/gif"
 
 
 class GalleryStore:
@@ -95,6 +99,7 @@ class GalleryStore:
         return {
             "image/jpeg": ".jpg",
             "image/webp": ".webp",
+            "image/gif": ".gif",
         }.get(str(media_type).lower(), ".png")
 
     def _record(self, row: sqlite3.Row | None) -> GalleryImage | None:
