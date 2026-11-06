@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import ipaddress
@@ -7,14 +8,14 @@ import json
 import mimetypes
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
 
 from .errors import ImageAPIError
-from .gif_support import GifOptions, first_frame_png, validate_gif
+from .gif_support import GifOptions, first_frame_png, prepare_gif
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,7 +179,10 @@ class OpenAICompatibleImageClient:
         )
         result = await self._parse_image_response(data)
         if animation is not None:
-            validate_gif(result.content, options=animation, operation="文生动图")
+            content = await asyncio.to_thread(
+                prepare_gif, result.content, options=animation, operation="文生动图"
+            )
+            result = replace(result, content=content)
         return result
 
     @staticmethod
@@ -280,7 +284,10 @@ class OpenAICompatibleImageClient:
             raise ImageAPIError("参考图生图返回格式不正确。")
         result = await self._parse_image_response(payload)
         if animation is not None:
-            validate_gif(result.content, options=animation, operation="参考图生动图")
+            content = await asyncio.to_thread(
+                prepare_gif, result.content, options=animation, operation="参考图生动图"
+            )
+            result = replace(result, content=content)
         return result
 
     async def chat_completion(self, model: str, prompt: str, *, timeout_seconds: float = 45) -> str:

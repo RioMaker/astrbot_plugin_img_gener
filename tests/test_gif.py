@@ -17,10 +17,15 @@ from astrbot_plugin_img_gener.contact_sheet import build_gallery_grid
 from astrbot_plugin_img_gener.errors import ConfigurationError, ImageAPIError
 from astrbot_plugin_img_gener.gallery import GalleryStore
 from astrbot_plugin_img_gener.gallery_render import build_personal_gallery
-from astrbot_plugin_img_gener.gif_support import GifOptions, first_frame_png
+from astrbot_plugin_img_gener.gif_support import (
+    GifOptions,
+    first_frame_png,
+    prepare_gif,
+    validate_gif,
+)
 from astrbot_plugin_img_gener.image_client import ImageResponse, OpenAICompatibleImageClient
 from astrbot_plugin_img_gener.user_profiles import UserProfileStore
-from PIL import Image, ImageDraw
+from PIL import GifImagePlugin, Image, ImageDraw
 from test_main_background import _install_astrbot_stubs
 
 
@@ -181,7 +186,7 @@ def test_gif_download_url_preserves_media_type_and_bytes(gif_content, monkeypatc
         ("png", "unexpected_format", "PNG"),
         ("single", "single_frame", "只有 1 帧"),
         ("broken", "decode_error", "文件损坏"),
-        ("pixels", "pixel_limit", "总像素上限 4000 万"),
+        ("pixels", "source_pixel_limit", "安全解码上限"),
     ],
 )
 def test_gif_failure_explains_returned_file_and_request(
@@ -194,8 +199,8 @@ def test_gif_failure_explains_returned_file_and_request(
         Image.new("RGB", (64, 64), "red").save(single, "GIF")
         content = single.getvalue()
     elif kind == "pixels":
-        # Keep the 16 real frames but declare a 2K canvas: validation must stop before decoding it.
-        content = gif_content[:6] + (2048).to_bytes(2, "little") * 2 + gif_content[10:]
+        # An 8K canvas exceeds the bounded source decoder; do not expand its frame data.
+        content = gif_content[:6] + (8192).to_bytes(2, "little") * 2 + gif_content[10:]
     else:
         content = b"GIF89a truncated"
     real_client = httpx.AsyncClient
@@ -229,8 +234,102 @@ def test_gif_failure_explains_returned_file_and_request(
     expected_operation = "参考图生动图" if operation == "edit" else "文生动图"
     assert f"operation={expected_operation}" in detail
     if kind == "pixels":
-        assert "format=GIF size=2048x2048 frames=16" in detail
+        assert "format=GIF size=8192x8192 frames=16" in detail
     assert "private-test-key" not in detail and "private-test-prompt" not in detail
+
+
+@pytest.mark.parametrize("operation", ["generate", "edit"])
+def test_2k_16_frame_response_is_resized_before_output_budget(
+    gif_content, monkeypatch, operation, tmp_path
+):
+    # GIF frames can update a small rectangle on a larger logical canvas.
+    large = gif_content[:6] + (2048).to_bytes(2, "little") * 2 + gif_content[10:]
+    with pytest.raises(ImageAPIError) as original_error:
+        validate_gif(large)
+    assert "reason=pixel_limit" in original_error.value.detail
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kw: real_client(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200,
+                    json={
+                        "data": [
+                            {
+                                "b64_json": base64.b64encode(large).decode(),
+                                "revised_prompt": "保留参考人物",
+                            }
+                        ]
+                    },
+                )
+            ),
+            **kw,
+        ),
+    )
+    client = OpenAICompatibleImageClient(base_url="https://example.test/v1", api_key="test")
+    args = ("可可子吃巧克力",)
+    if operation == "edit":
+        args += ([("reference.png", first_frame_png(gif_content), "image/png")],)
+    result = asyncio.run(
+        getattr(client, operation)(*args, size="512x512", quality="low", animation=GifOptions())
+    )
+    assert result.media_type == "image/gif" and result.revised_prompt == "保留参考人物"
+    with Image.open(io.BytesIO(result.content)) as prepared:
+        assert prepared.size == (512, 512) and prepared.n_frames == 16
+        assert prepared.info["loop"] == 0
+        for index in range(16):
+            prepared.seek(index)
+            assert prepared.info["duration"] == 40
+            red, green, _ = prepared.convert("RGB").getpixel((4, 4))
+            assert abs(red - (255 - index * 10)) <= 2
+            assert abs(green - index * 10) <= 2
+    store = GalleryStore(tmp_path / "gallery")
+    archived = archive_image(store, result.content)
+    assert archived.is_animated and archived.image_path.read_bytes() == result.content
+
+
+def test_gif_resize_preserves_transparency_aspect_timing_and_loop():
+    frames = []
+    for x in (80, 600):
+        frame = Image.new("RGBA", (1024, 512), (0, 0, 0, 0))
+        ImageDraw.Draw(frame).rectangle((x, 80, x + 160, 240), fill=(255, 0, 0, 255))
+        frames.append(frame)
+    original = io.BytesIO()
+    frames[0].save(
+        original,
+        "GIF",
+        save_all=True,
+        append_images=frames[1:],
+        duration=[40, 80],
+        loop=3,
+        disposal=2,
+    )
+    result = prepare_gif(original.getvalue(), options=GifOptions(), operation="参考图生动图")
+    with Image.open(io.BytesIO(result)) as image:
+        assert image.size == (512, 256) and image.n_frames == 2 and image.info["loop"] == 3
+        for index, duration in enumerate((40, 80)):
+            image.seek(index)
+            frame = image.convert("RGBA")
+            assert image.info["duration"] == duration and frame.getpixel((0, 0))[3] == 0
+            assert frame.getpixel((80 if index == 0 else 340, 80)) == (255, 0, 0, 255)
+
+
+def test_gif_resize_rejects_excess_source_work_before_loading_frames(monkeypatch):
+    frames = [Image.new("RGB", (16, 16), (index * 7, 0, 0)) for index in range(33)]
+    stream = io.BytesIO()
+    frames[0].save(stream, "GIF", save_all=True, append_images=frames[1:], duration=40)
+    encoded = stream.getvalue()
+    oversized = encoded[:6] + (2048).to_bytes(2, "little") * 2 + encoded[10:]
+
+    def must_not_decode(*args, **kwargs):
+        raise AssertionError("Source limit must be checked before decoding frames")
+
+    monkeypatch.setattr(GifImagePlugin.GifImageFile, "load", must_not_decode)
+    with pytest.raises(ImageAPIError) as error:
+        prepare_gif(oversized, options=GifOptions(), operation="参考图生动图")
+    assert "reason=source_pixel_limit" in error.value.detail
 
 
 @pytest.mark.parametrize(

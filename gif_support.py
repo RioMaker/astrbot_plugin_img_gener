@@ -10,6 +10,10 @@ from PIL import Image
 from .config import as_int, get_config
 from .errors import ConfigurationError, ImageAPIError
 
+MAX_GIF_OUTPUT_PIXELS = 40_000_000
+MAX_GIF_SOURCE_FRAME_PIXELS = 4096 * 4096
+MAX_GIF_SOURCE_TOTAL_PIXELS = 128 * 1024 * 1024
+
 
 @dataclass(frozen=True, slots=True)
 class GifOptions:
@@ -82,6 +86,22 @@ def validate_gif(
     content: bytes, *, options: GifOptions | None = None, operation: str = "生动图"
 ) -> None:
     """Validate returned GIFs and retain non-sensitive metadata in failure diagnostics."""
+    _process_gif(content, options=options, operation=operation)
+
+
+def prepare_gif(content: bytes, *, options: GifOptions, operation: str) -> bytes:
+    """Downsize oversized upstream animations before applying the output decode budget."""
+    target = tuple(int(part) for part in options.size.split("x"))
+    return _process_gif(content, options=options, operation=operation, resize_to=target)
+
+
+def _process_gif(
+    content: bytes,
+    *,
+    options: GifOptions | None,
+    operation: str,
+    resize_to: tuple[int, int] | None = None,
+) -> bytes:
     metadata = {
         "operation": operation,
         "bytes": len(content),
@@ -124,16 +144,62 @@ def validate_gif(
                 raise failure(
                     "frame_limit", f"上游返回 GIF 共 {frames} 帧，超过本地校验上限 256 帧。"
                 )
-            if image.width * image.height * frames > 40_000_000:
+            original_size = image.size
+            resize = resize_to is not None and (
+                image.width > resize_to[0] or image.height > resize_to[1]
+            )
+            pixels = image.width * image.height
+            if resize and (
+                pixels > MAX_GIF_SOURCE_FRAME_PIXELS
+                or pixels * frames > MAX_GIF_SOURCE_TOTAL_PIXELS
+            ):
+                raise failure(
+                    "source_pixel_limit",
+                    f"上游返回 GIF 为 {image.width}×{image.height}、{frames} 帧，"
+                    "超过逐帧缩放的安全解码上限，未读取完整帧数据。",
+                )
+            output_pixels = resize_to[0] * resize_to[1] if resize else pixels
+            if output_pixels * frames > MAX_GIF_OUTPUT_PIXELS:
                 raise failure(
                     "pixel_limit",
                     f"上游返回 GIF 为 {image.width}×{image.height}、{frames} 帧，"
                     "超过本地总像素上限 4000 万；请降低尺寸或帧数。",
                 )
+            resized_frames = []
+            durations = []
+            loop = image.info.get("loop")
             for index in range(frames):
                 metadata["checking_frame"] = index + 1
                 image.seek(index)
+                if image.size != original_size:
+                    raise failure("canvas_change", "上游 GIF 的画布尺寸在帧间变化，无法安全处理。")
                 image.load()
+                if resize:
+                    # Keep only small composited frames; never retain all source-resolution frames.
+                    frame = image.convert("RGBA")
+                    frame.thumbnail(resize_to, Image.Resampling.LANCZOS)
+                    if frame.getextrema()[3] == (255, 255):
+                        # RGB adaptive quantization retains subtle opaque-frame color changes.
+                        frame = frame.convert("RGB")
+                    resized_frames.append(frame)
+                    durations.append(image.info.get("duration", options.frame_duration_ms))
+            if resize:
+                output = io.BytesIO()
+                save_options = {"loop": loop} if loop is not None else {}
+                resized_frames[0].save(
+                    output,
+                    "GIF",
+                    save_all=True,
+                    append_images=resized_frames[1:],
+                    duration=durations,
+                    disposal=2,
+                    optimize=False,
+                    **save_options,
+                )
+                prepared = output.getvalue()
+                validate_gif(prepared, options=options, operation=operation)
+                return prepared
+            return content
     except Image.DecompressionBombError as exc:
         raise failure("decode_pixel_limit", "返回图片的像素过大，已停止 GIF 解码。", exc) from exc
     except (OSError, ValueError, EOFError) as exc:
