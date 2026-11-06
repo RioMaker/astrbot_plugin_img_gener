@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 from PIL import Image
 
-from .config import get_config
+from .config import as_int, get_config
 from .errors import ConfigurationError, ImageAPIError
 
 
@@ -18,6 +18,7 @@ class GifOptions:
     quality: str = "low"
     frame_count: int = 16
     frame_duration_ms: int = 40
+    timeout_seconds: int = 300
 
     def __post_init__(self):
         if not isinstance(self.model, str) or not self.model.strip():
@@ -34,16 +35,23 @@ class GifOptions:
             or self.frame_duration_ms % 10
         ):
             raise ConfigurationError("GIF 每帧时长必须为 20～2000 毫秒，且为 10 的倍数。")
+        if type(self.timeout_seconds) is not int or not 10 <= self.timeout_seconds <= 1_000_000:
+            raise ConfigurationError("GIF 超时必须为 0（沿用生图超时）或 10～1000000 秒的整数。")
 
     @classmethod
     def from_config(cls, config):
         defaults = cls()
-        return cls(
-            **{
-                key: get_config(config, "animation", key, default=getattr(defaults, key))
-                for key in cls.__dataclass_fields__
-            }
-        )
+        values = {
+            key: get_config(config, "animation", key, default=getattr(defaults, key))
+            for key in cls.__dataclass_fields__
+        }
+        timeout = get_config(config, "animation", "timeout_seconds", default=0)
+        if type(timeout) is int and timeout == 0:
+            timeout = as_int(
+                get_config(config, "api", "timeout_seconds", default=300), 300, minimum=10
+            )
+        values["timeout_seconds"] = timeout
+        return cls(**values)
 
     def request_fields(self) -> dict:
         return {

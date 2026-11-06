@@ -173,7 +173,9 @@ class OpenAICompatibleImageClient:
             payload["quality"] = quality
         if animation is not None:
             payload.update(animation.request_fields())
-        data = await self._post_json("/images/generations", payload)
+        data = await self._post_json(
+            "/images/generations", payload, timeout=animation.timeout_seconds if animation else None
+        )
         result = await self._parse_image_response(data)
         if animation is not None:
             validate_gif(result.content)
@@ -238,10 +240,13 @@ class OpenAICompatibleImageClient:
         files: list[tuple[str, tuple[str, bytes, str]]] = [
             (self.edit_image_field, source) for source in sources
         ]
+        configured_timeout = animation.timeout_seconds if animation else self.timeout_seconds
         started = time.monotonic()
         try:
             async with httpx.AsyncClient(
-                headers=self._headers(), timeout=self._timeout(), follow_redirects=True
+                headers=self._headers(),
+                timeout=self._timeout(configured_timeout),
+                follow_redirects=True,
             ) as client:
                 response = await client.post(
                     f"{self.base_url}/images/edits", data=form_data, files=files
@@ -250,10 +255,10 @@ class OpenAICompatibleImageClient:
             elapsed = time.monotonic() - started
             raise ImageAPIError(
                 f"参考图生图响应超时（已等待约 {elapsed:.0f} 秒，"
-                f"配置上限 {self.timeout_seconds:.0f} 秒）。",
+                f"配置上限 {configured_timeout:.0f} 秒）。",
                 detail=(
                     f"operation=参考图生图 path=/images/edits elapsed={elapsed:.2f}s "
-                    f"limit={self.timeout_seconds:.2f}s error={type(exc).__name__}: {exc}"
+                    f"limit={configured_timeout:.2f}s error={type(exc).__name__}: {exc}"
                 ),
             ) from exc
         except httpx.HTTPError as exc:

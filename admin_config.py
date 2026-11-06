@@ -71,6 +71,7 @@ class AdminConfig:
             minimum = 0 if path.rsplit(".", 1)[-1] in ZERO_ALLOWED else 1
             minimum = {
                 "api.timeout_seconds": 10,
+                "animation.timeout_seconds": 0,
                 "safety.review_timeout_seconds": 5,
                 "safety.max_prompt_chars": 200,
             }.get(path, minimum)
@@ -155,7 +156,7 @@ class AdminConfig:
             for group, section in self.schema.items()
         }
         try:
-            GifOptions.from_config(values)
+            animation = GifOptions.from_config(values)
         except ConfigurationError as exc:
             raise AdminError(exc.public_message) from exc
         limits = LimitConfig(
@@ -164,7 +165,9 @@ class AdminConfig:
                 for key in LimitConfig.__dataclass_fields__
                 if key != "reservation_ttl_seconds"
             },
-            reservation_ttl_seconds=max(300, int(values["api"]["timeout_seconds"]) * 2),
+            reservation_ttl_seconds=max(
+                300, int(values["api"]["timeout_seconds"]) * 2, animation.timeout_seconds * 2
+            ),
         )
         refs = values["references"]
         references = CharacterReferenceManager(

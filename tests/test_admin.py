@@ -254,6 +254,10 @@ def test_settings_mask_secrets_preserve_unmodified_keys_and_apply_runtime(plugin
         {"animation": {"frame_count": 17}},
         {"animation": {"frame_duration_ms": 41}},
         {"animation": {"size": "auto"}},
+        {"animation": {"timeout_seconds": 1}},
+        {"animation": {"timeout_seconds": -1}},
+        {"animation": {"timeout_seconds": True}},
+        {"animation": {"timeout_seconds": 1000001}},
         {"generation": {"allowed_sizes": [123]}},
         {"references": {"characters": [{"__template_key": "../bad"}]}},
         {"safety": {"blocked_terms": "bad"}},
@@ -266,6 +270,25 @@ def test_settings_validation_is_atomic(plugin, changes):
         settings.save({"revision": settings.revision(), "changes": changes})
     assert dict(plugin.config) == before
     assert plugin.config.saved is None
+
+
+def test_gif_timeout_setting_persists_and_keeps_reservations_alive(plugin):
+    settings = AdminConfig(plugin)
+    assert settings.read()["values"]["animation"]["timeout_seconds"] == 0
+    result = settings.save(
+        {"revision": settings.revision(), "changes": {"animation": {"timeout_seconds": 720}}}
+    )
+    assert result["values"]["animation"]["timeout_seconds"] == 720
+    assert plugin.config.saved["animation"]["timeout_seconds"] == 720
+    assert plugin.rate_limiter.limits.reservation_ttl_seconds == 1440
+    result = settings.save(
+        {
+            "revision": settings.revision(),
+            "changes": {"api": {"timeout_seconds": 900}, "animation": {"timeout_seconds": 0}},
+        }
+    )
+    assert result["values"]["animation"]["timeout_seconds"] == 0
+    assert plugin.rate_limiter.limits.reservation_ttl_seconds == 1800
 
 
 def test_settings_busy_write_failure_and_explicit_secret_clear(plugin):

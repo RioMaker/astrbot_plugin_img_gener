@@ -193,6 +193,7 @@ class GPTImageGeneratorPlugin(Star):
             reservation_ttl_seconds=max(
                 300,
                 self._int("api", "timeout_seconds", default=300, minimum=10) * 2,
+                self._int("animation", "timeout_seconds", default=0, minimum=0) * 2,
             ),
         )
         self.rate_limiter = PersistentRateLimiter(

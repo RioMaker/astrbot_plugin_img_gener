@@ -22,12 +22,14 @@
 
 将本仓库放入 AstrBot 的 `data/plugins/astrbot_plugin_img_gener`，或者在 AstrBot WebUI 的插件页通过仓库 URL/压缩包安装。插件管理器会读取 `requirements.txt` 安装 `httpx`。
 
-## GIF 动图（v0.3.0）
+## GIF 动图（v0.3.1）
 
 使用 `/生动图 一只橘猫眨眼、挥手，无缝循环` 生成 GIF，内容描述无需方括号。
 默认调用 UUAPI `gpt-image-2.6`，每帧 **512×512**、**low** 质量、**16 帧**、**40ms/帧**，一轮约 **0.64 秒**。
 在插件设置的「GIF 动图」中调整这些参数；与普通生图共用现有 API 地址、Key、安全审核、冷却、并发和额度。
 支持人物和引用参考图，动图参数在入队时冻结。现有 `generate_image` LLM 工具仍用于普通图片。
+
+**超时设置：**「插件设置 → GIF 动图 → 动图超时（秒）」默认 `0`，沿用「生图 API → 生图超时」（默认 **300 秒 / 5 分钟**）；填写 `600` 即为动图单独设置 **10 分钟**。独立值支持 10～1000000 秒，纯文生动图和带参考图均适用，保存后对新任务生效。审核另用审核超时；连接最长等待 20 秒，上游提前报错时仍会结束。
 
 - 文生动图走 `/v1/images/generations`，带参考图走 `/v1/images/edits`；传递 `output_format=gif`、`frame_count`、`frame_duration_ms`。
 - UUAPI 按一张图片计费，帧数不改变按张计费；明确填小尺寸以避免 `auto` 的 2K 档，1K 档以下不保证进一步降价。模型权限以当前 Key 的 `/v1/models` 为准。[接口文档](https://uuapi.net/docs#image-groups)

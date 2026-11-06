@@ -61,8 +61,10 @@ def test_gif_request_wire_format_and_original_bytes(gif_content, monkeypatch, op
     monkeypatch.setattr(
         httpx, "AsyncClient", lambda **kw: real_client(transport=httpx.MockTransport(respond), **kw)
     )
-    client = OpenAICompatibleImageClient(base_url="https://example.test/v1", api_key="test")
-    kwargs = dict(size="816x816", quality="high", animation=GifOptions())
+    client = OpenAICompatibleImageClient(
+        base_url="https://example.test/v1", api_key="test", timeout_seconds=90
+    )
+    kwargs = dict(size="816x816", quality="high", animation=GifOptions(timeout_seconds=720))
     if operation == "generate":
         result = asyncio.run(client.generate("猫挥手", **kwargs))
     else:
@@ -73,18 +75,82 @@ def test_gif_request_wire_format_and_original_bytes(gif_content, monkeypatch, op
     assert result.content == gif_content
     assert result.extension == ".gif" and result.media_type == "image/gif"
     request = requests[0]
+    assert request.extensions["timeout"]["read"] == 720
+    assert request.extensions["timeout"]["connect"] == 20
     if operation == "edit":
         assert request.url.path == "/v1/images/edits"
         body = request.content.decode("latin1")
         for key, value in GifOptions().request_fields().items():
             assert f'name="{key}"\r\n\r\n{value}\r\n' in body
         assert 'name="image"; filename="ref.png"' in body
+        assert 'name="timeout_seconds"' not in body
     else:
         assert request.url.path == "/v1/images/generations"
         body = json.loads(request.content)
         assert GifOptions().request_fields().items() <= body.items()
         assert body["response_format"] == "b64_json" and body["n"] == 1
+        assert "timeout_seconds" not in body
     assert client.model == "gpt-image-2"  # GIF must not change the still-image model.
+    asyncio.run(client.generate("静态图", size="816x816", quality="low"))
+    assert requests[-1].extensions["timeout"]["read"] == 90
+
+
+@pytest.mark.parametrize("operation", ["generate", "edit"])
+def test_gif_timeout_reports_effective_override(gif_content, monkeypatch, operation):
+    def timed_out(request):
+        assert request.extensions["timeout"]["read"] == 720
+        raise httpx.ReadTimeout("test timeout", request=request)
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kw: real_client(transport=httpx.MockTransport(timed_out), **kw),
+    )
+    client = OpenAICompatibleImageClient(base_url="https://example.test/v1", api_key="test")
+    args = ("猫挥手",)
+    if operation == "edit":
+        args += ([("ref.png", first_frame_png(gif_content), "image/png")],)
+    with pytest.raises(ImageAPIError) as error:
+        asyncio.run(
+            getattr(client, operation)(
+                *args, size="512x512", quality="low", animation=GifOptions(timeout_seconds=720)
+            )
+        )
+    assert "配置上限 720 秒" in error.value.public_message
+    assert "limit=720.00s" in error.value.detail
+
+
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        ({}, 300),
+        ({"api": {"timeout_seconds": 600}}, 600),
+        ({"api": {"timeout_seconds": 600}, "animation": {"timeout_seconds": 0}}, 600),
+        ({"api": {"timeout_seconds": 600}, "animation": {"timeout_seconds": 720}}, 720),
+    ],
+)
+def test_gif_timeout_inherits_existing_config_unless_overridden(config, expected):
+    assert GifOptions.from_config(config).timeout_seconds == expected
+
+
+def test_long_gif_reservation_survives_original_timeout_after_reload(tmp_path, monkeypatch):
+    _install_astrbot_stubs()
+    sys.modules.pop("astrbot_plugin_img_gener.main", None)
+    module = importlib.import_module("astrbot_plugin_img_gener.main")
+    monkeypatch.setattr(module, "get_astrbot_plugin_data_path", lambda: str(tmp_path))
+    monkeypatch.setattr(module, "register_admin_api", lambda plugin: None)
+    plugin = module.GPTImageGeneratorPlugin(object(), {"animation": {"timeout_seconds": 720}})
+
+    async def scenario():
+        first = await plugin.rate_limiter.acquire("first", "group", now=10000)
+        assert first.allowed
+        # The previous 600-second reservation must not expire during a 720-second GIF request.
+        second = await plugin.rate_limiter.acquire("second", "group", now=10700)
+        assert not second.allowed and second.code == "GROUP_BUSY"
+        await plugin.rate_limiter.cancel(first.lease_id)
+
+    asyncio.run(scenario())
 
 
 def test_gif_download_url_preserves_media_type_and_bytes(gif_content, monkeypatch):
@@ -136,6 +202,10 @@ def test_gif_request_rejects_invalid_or_static_results(gif_content, content):
         {"size": "auto"},
         {"quality": "bad"},
         {"model": " "},
+        {"timeout_seconds": 1},
+        {"timeout_seconds": -1},
+        {"timeout_seconds": True},
+        {"timeout_seconds": 1000001},
     ],
 )
 def test_gif_settings_reject_invalid_values(values):
@@ -271,6 +341,7 @@ class Event:
 
 def test_gif_command_queue_freezes_options_and_history_returns_original(gif_plugin, gif_content):
     module, plugin = gif_plugin
+    plugin.config["animation"] = {"timeout_seconds": 720}
     captured = []
 
     class Client:
@@ -287,7 +358,7 @@ def test_gif_command_queue_freezes_options_and_history_returns_original(gif_plug
         assert next(iter(plugin._active_jobs.values())).source == "/生动图"
         plugin.config["animation"] = {"frame_count": 8, "size": "1024x1024"}
         await asyncio.gather(*plugin._background_tasks)
-        assert captured[0]["animation"] == GifOptions()
+        assert captured[0]["animation"] == GifOptions(timeout_seconds=720)
         with pytest.raises(FrozenInstanceError):
             captured[0]["animation"].frame_count = 8
         record = plugin.gallery_store.get(1)
