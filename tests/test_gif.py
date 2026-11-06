@@ -174,20 +174,63 @@ def test_gif_download_url_preserves_media_type_and_bytes(gif_content, monkeypatc
     assert result.content == gif_content and result.extension == ".gif"
 
 
-@pytest.mark.parametrize("content", [b"GIF89a truncated", b"png"])
-def test_gif_request_rejects_invalid_or_static_results(gif_content, content):
-    if content == b"png":
+@pytest.mark.parametrize("operation", ["generate", "edit"])
+@pytest.mark.parametrize(
+    ("kind", "reason", "message"),
+    [
+        ("png", "unexpected_format", "PNG"),
+        ("single", "single_frame", "只有 1 帧"),
+        ("broken", "decode_error", "文件损坏"),
+        ("pixels", "pixel_limit", "总像素上限 4000 万"),
+    ],
+)
+def test_gif_failure_explains_returned_file_and_request(
+    gif_content, monkeypatch, operation, kind, reason, message
+):
+    if kind == "png":
         content = first_frame_png(gif_content)
-    client = OpenAICompatibleImageClient(base_url="https://example.test/v1", api_key="test")
-
-    async def post(*args, **kwargs):
-        return {"data": [{"b64_json": base64.b64encode(content).decode()}]}
-
-    client._post_json = post
-    with pytest.raises(ImageAPIError):
+    elif kind == "single":
+        single = io.BytesIO()
+        Image.new("RGB", (64, 64), "red").save(single, "GIF")
+        content = single.getvalue()
+    elif kind == "pixels":
+        # Keep the 16 real frames but declare a 2K canvas: validation must stop before decoding it.
+        content = gif_content[:6] + (2048).to_bytes(2, "little") * 2 + gif_content[10:]
+    else:
+        content = b"GIF89a truncated"
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kw: real_client(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200, json={"data": [{"b64_json": base64.b64encode(content).decode()}]}
+                )
+            ),
+            **kw,
+        ),
+    )
+    client = OpenAICompatibleImageClient(
+        base_url="https://example.test/v1", api_key="private-test-key"
+    )
+    args = ("private-test-prompt",)
+    if operation == "edit":
+        args += ([("ref.png", first_frame_png(gif_content), "image/png")],)
+    with pytest.raises(ImageAPIError) as error:
         asyncio.run(
-            client.generate("猫挥手", size="512x512", quality="low", animation=GifOptions())
+            getattr(client, operation)(*args, size="512x512", quality="low", animation=GifOptions())
         )
+    assert message in error.value.public_message
+    detail = error.value.detail
+    assert f"reason={reason}" in detail
+    assert f"bytes={len(content)}" in detail
+    assert "model=gpt-image-2.6 requested_size=512x512 requested_frames=16" in detail
+    expected_operation = "参考图生动图" if operation == "edit" else "文生动图"
+    assert f"operation={expected_operation}" in detail
+    if kind == "pixels":
+        assert "format=GIF size=2048x2048 frames=16" in detail
+    assert "private-test-key" not in detail and "private-test-prompt" not in detail
 
 
 @pytest.mark.parametrize(

@@ -178,7 +178,7 @@ class OpenAICompatibleImageClient:
         )
         result = await self._parse_image_response(data)
         if animation is not None:
-            validate_gif(result.content)
+            validate_gif(result.content, options=animation, operation="文生动图")
         return result
 
     @staticmethod
@@ -280,7 +280,7 @@ class OpenAICompatibleImageClient:
             raise ImageAPIError("参考图生图返回格式不正确。")
         result = await self._parse_image_response(payload)
         if animation is not None:
-            validate_gif(result.content)
+            validate_gif(result.content, options=animation, operation="参考图生动图")
         return result
 
     async def chat_completion(self, model: str, prompt: str, *, timeout_seconds: float = 45) -> str:

@@ -78,16 +78,65 @@ def first_frame_png(content: bytes) -> bytes:
         raise ImageAPIError("无法读取 GIF 首帧，图片可能损坏或像素过大。") from exc
 
 
-def validate_gif(content: bytes) -> None:
-    """Reject malformed or static results before counting a GIF job as successful."""
+def validate_gif(
+    content: bytes, *, options: GifOptions | None = None, operation: str = "生动图"
+) -> None:
+    """Validate returned GIFs and retain non-sensitive metadata in failure diagnostics."""
+    metadata = {
+        "operation": operation,
+        "bytes": len(content),
+        "format": "unknown",
+        "size": "unknown",
+        "frames": "unknown",
+    }
+    if options is not None:
+        metadata.update(
+            model=options.model,
+            requested_size=options.size,
+            requested_frames=options.frame_count,
+        )
+
+    def failure(reason: str, message: str, cause: Exception | None = None) -> ImageAPIError:
+        details = {"reason": reason, **metadata}
+        if cause is not None:
+            details["error"] = type(cause).__name__
+            details["decode_error"] = " ".join(str(cause).split())[:200]
+        return ImageAPIError(
+            message, detail="gif_validation " + " ".join(f"{k}={v}" for k, v in details.items())
+        )
+
     try:
         with Image.open(io.BytesIO(content)) as image:
-            if image.format != "GIF" or not 2 <= image.n_frames <= 256:
-                raise ValueError("not an animated GIF")
-            if image.width * image.height * image.n_frames > 40_000_000:
-                raise ValueError("animation exceeds decode limit")
-            for index in range(image.n_frames):
+            metadata.update(format=image.format or "unknown", size=f"{image.width}x{image.height}")
+            if image.format != "GIF":
+                raise failure(
+                    "unexpected_format",
+                    f"已请求 GIF 动图，但上游返回了 {image.format or '其他'} 格式图片"
+                    f"（{image.width}×{image.height}），本次未作为动图归档。",
+                )
+            frames = image.n_frames
+            metadata["frames"] = frames
+            if frames < 2:
+                raise failure(
+                    "single_frame", "上游返回的 GIF 只有 1 帧，是静态图，本次未作为动图归档。"
+                )
+            if frames > 256:
+                raise failure(
+                    "frame_limit", f"上游返回 GIF 共 {frames} 帧，超过本地校验上限 256 帧。"
+                )
+            if image.width * image.height * frames > 40_000_000:
+                raise failure(
+                    "pixel_limit",
+                    f"上游返回 GIF 为 {image.width}×{image.height}、{frames} 帧，"
+                    "超过本地总像素上限 4000 万；请降低尺寸或帧数。",
+                )
+            for index in range(frames):
+                metadata["checking_frame"] = index + 1
                 image.seek(index)
                 image.load()
-    except (OSError, ValueError, EOFError, Image.DecompressionBombError) as exc:
-        raise ImageAPIError("生图服务未返回有效的 GIF 动图，请检查模型和上游 GIF 支持。") from exc
+    except Image.DecompressionBombError as exc:
+        raise failure("decode_pixel_limit", "返回图片的像素过大，已停止 GIF 解码。", exc) from exc
+    except (OSError, ValueError, EOFError) as exc:
+        raise failure(
+            "decode_error", "返回的 GIF 文件损坏、内容不完整或无法解码，本次未作为动图归档。", exc
+        ) from exc
