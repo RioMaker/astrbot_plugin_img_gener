@@ -2170,9 +2170,11 @@ class GPTImageGeneratorPlugin(Star):
         characters: list[str] | None = None,
         portrait_user_qqs: list[str] | None = None,
     ) -> str:
-        """Submit one image generation request to GPT Image 2 and return immediately.
+        """Submit one static image request to GPT Image 2 and return immediately.
 
-        Use this tool only when the user clearly asks to create an image. First
+        Use this tool only when the user clearly asks to create a static image.
+        For GIFs, animations, or making a referenced image move, use generate_gif
+        instead. Never submit a static image while claiming to generate a GIF. First
         rewrite the user's request into a complete, directly usable CHINESE image
         prompt. Do not copy the conversational message verbatim and do not translate
         the prompt to English. Remove request wrappers such as “帮我画一张”, while
@@ -2217,39 +2219,111 @@ class GPTImageGeneratorPlugin(Star):
             portrait_user_qqs(array): QQ portrait subjects; use ["self"] for the
                 requester or explicit QQ numbers after @/alias confirmation.
         """  # noqa: E501
+        return await self._submit_generation_tool(
+            event,
+            prompt,
+            size=size,
+            quality=quality,
+            characters=characters,
+            portrait_user_qqs=portrait_user_qqs,
+        )
+
+    @filter.llm_tool(name="generate_gif")
+    async def generate_gif(
+        self,
+        event: AstrMessageEvent,
+        prompt: str,
+        characters: list[str] | None = None,
+        portrait_user_qqs: list[str] | None = None,
+    ) -> str:
+        """Submit one GIF animation request with references and return immediately.
+
+        Use this tool when the user explicitly asks for a GIF, an animation, or to
+        make a referenced image move. Call it directly for the current message;
+        do not send /生动图 as a new message or use generate_image for an animation.
+        Rewrite the request into a complete CHINESE prompt describing the desired
+        subjects, motion, composition, style, and loop. Preserve the user's
+        constraints; do not copy conversational wrappers or translate to English.
+
+        Configured characters, QQ portrait references, and images in the current
+        message's quoted/replied historical message are attached automatically.
+        Explain their role in prompt; preserve referenced appearances unless the
+        user requests changes. Reference GIFs contribute their first frame only.
+        Direct attachments are not automatically used: ask the user to reply to
+        the image message when they want it used as a reference. Never replace
+        a reference with a text-only description. Do not borrow another sender's
+        prompt, reference images, or portrait subjects from group history.
+        Use ["self"] for the requester's portrait or confirmed QQ numbers for
+        other users. Relay ambiguous identity candidates and wait for confirmation.
+
+        Uses the plugin's GIF settings (default gpt-image-2.6, 512x512, low,
+        16 frames, 40ms/frame) and shares safety review and quotas with static images.
+        Only an accepted result means generation is running in the BACKGROUND;
+        relay its task number and prompt hash unchanged, and never claim the GIF
+        is finished. Relay rejections or reference failures as returned. The
+        plugin sends the finished GIF later. For progress or remaining quota,
+        call get_image_generation_status instead of submitting another task.
+
+        Args:
+            prompt(string): AI-prepared complete Chinese animation prompt, including motion and how to use the references.
+            characters(array): Optional configured character names; omit to auto-detect from the original request and prompt.
+            portrait_user_qqs(array): QQ portrait subjects; use ["self"] for the requester or confirmed explicit QQ numbers.
+        """  # noqa: E501
+        return await self._submit_generation_tool(
+            event,
+            prompt,
+            characters=characters,
+            portrait_user_qqs=portrait_user_qqs,
+            animated=True,
+        )
+
+    async def _submit_generation_tool(
+        self,
+        event: AstrMessageEvent,
+        prompt: str,
+        *,
+        size: str | None = None,
+        quality: str | None = None,
+        characters: list[str] | None = None,
+        portrait_user_qqs: list[str] | None = None,
+        animated: bool = False,
+    ) -> str:
+        """Keep both AI entry points on the same task-local reference pipeline."""
         frozen_event = self._freeze_generation_event(event)
         frozen_characters = tuple(str(item) for item in characters or ())
-        frozen_portrait_requests = tuple(
-            str(item) for item in portrait_user_qqs or ()
-        )
+        frozen_portrait_requests = tuple(str(item) for item in portrait_user_qqs or ())
         if not self._is_allowed(frozen_event):
             return "生图功能未启用，或当前用户/群没有使用权限。"
         original_message = frozen_event.get_message_str()
-        effective_prompt, reference_prompt = self._effective_tool_prompt(
-            prompt, original_message
-        )
+        effective_prompt, reference_prompt = self._effective_tool_prompt(prompt, original_message)
         if not effective_prompt:
             return "请提供需要生成的画面描述。"
+        source = "LLM GIF" if animated else "LLM"
+        tool_name = "generate_gif" if animated else "generate_image"
         if not self._contains_cjk(effective_prompt):
             message = (
                 "请先将用户需求整理成完整、可直接生图的中文提示词，再调用 "
-                "generate_image；不要传入英文提示词，也不要直接复制用户原话。"
+                f"{tool_name}；不要传入英文提示词，也不要直接复制用户原话。"
             )
             return self._record_rejected_attempt(
                 frozen_event,
-                source="LLM",
+                source=source,
                 prompt=effective_prompt,
                 size=str(size or DEFAULT_IMAGE_SIZE),
                 quality=quality,
                 stage="中文提示词校验失败",
                 message=message,
             )
+        animation = None
         try:
-            selected_size = self._normalize_size(size)
+            animation = GifOptions.from_config(self.config) if animated else None
+            selected_size = animation.size if animation else self._normalize_size(size)
+            if animation:
+                quality = animation.quality
         except ImageGeneratorError as exc:
             return self._record_rejected_attempt(
                 frozen_event,
-                source="LLM",
+                source=source,
                 prompt=effective_prompt,
                 size=str(size or DEFAULT_IMAGE_SIZE),
                 quality=quality,
@@ -2264,20 +2338,18 @@ class GPTImageGeneratorPlugin(Star):
         if portrait_error:
             return self._record_rejected_attempt(
                 frozen_event,
-                source="LLM",
+                source=source,
                 prompt=effective_prompt,
                 size=selected_size,
                 quality=quality,
                 stage="人物身份待确认",
                 message=portrait_error,
             )
-        local_rejection = await self._preflight_local_review(
-            frozen_event, effective_prompt
-        )
+        local_rejection = await self._preflight_local_review(frozen_event, effective_prompt)
         if local_rejection:
             return self._record_rejected_attempt(
                 frozen_event,
-                source="LLM",
+                source=source,
                 prompt=effective_prompt,
                 size=selected_size,
                 quality=quality,
@@ -2285,13 +2357,11 @@ class GPTImageGeneratorPlugin(Star):
                 message=local_rejection,
             )
         try:
-            quoted_sources = await self._capture_quoted_reference_sources(
-                frozen_event
-            )
+            quoted_sources = await self._capture_quoted_reference_sources(frozen_event)
         except ImageGeneratorError as exc:
             return self._record_rejected_attempt(
                 frozen_event,
-                source="LLM",
+                source=source,
                 prompt=effective_prompt,
                 size=selected_size,
                 quality=quality,
@@ -2307,14 +2377,18 @@ class GPTImageGeneratorPlugin(Star):
             portrait_user_qqs=portrait_subjects,
             reference_prompt=reference_prompt,
             quoted_image_sources=quoted_sources,
-            source="LLM",
+            source=source,
+            animation=animation,
         )
-        return await self._start_notice(
+        notice = await self._start_notice(
             frozen_event,
             selected_size,
             job_id=job_id,
             prompt=effective_prompt,
         )
+        if animation:
+            notice += f"\nGIF 动图：{animation.frame_count} 帧 · {animation.frame_duration_ms}ms/帧"
+        return notice
 
     @filter.command("生图", alias={"绘图", "draw"})
     async def draw_command(self, event: AstrMessageEvent, prompt: GreedyStr = ""):

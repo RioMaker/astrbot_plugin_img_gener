@@ -151,8 +151,10 @@ def test_llm_tool_returns_before_background_generation_finishes() -> None:
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("tool_name", ["generate_image", "generate_gif"])
 def test_consecutive_group_jobs_keep_owner_route_prompt_and_image_snapshot(
     tmp_path,
+    tool_name,
 ) -> None:
     async def scenario() -> None:
         _install_astrbot_stubs()
@@ -260,7 +262,7 @@ def test_consecutive_group_jobs_keep_owner_route_prompt_and_image_snapshot(
 
         event = MutableEvent()
         first_request = asyncio.create_task(
-            plugin.generate_image(event, "红色列车驶过雪山，电影感构图")
+            getattr(plugin, tool_name)(event, "红色列车驶过雪山，电影感构图")
         )
         await resolution_started.wait()
         event.sender_id = "10002"
@@ -272,7 +274,7 @@ def test_consecutive_group_jobs_keep_owner_route_prompt_and_image_snapshot(
         ]
         release_resolution.set()
         first_notice = await first_request
-        second_notice = await plugin.generate_image(
+        second_notice = await getattr(plugin, tool_name)(
             event, "蓝色帆船穿过海湾，清晨薄雾"
         )
 
@@ -359,6 +361,7 @@ def test_llm_tool_uses_ai_generated_chinese_prompt_and_keeps_reference_text() ->
             event,
             generated_prompt,
         )
+        assert "任务标识：#1 / P-" in result
         await asyncio.sleep(0)
 
         assert received["prompt"] == generated_prompt

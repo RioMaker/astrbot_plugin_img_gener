@@ -1,8 +1,8 @@
 name: astrbot_plugin_img_gener
 display_name: GPT Image 2 安全生图
-short_desc: 安全生图与 GPT Image 2.6 GIF 动图，支持统一图库、个人画廊和内置管理页。
+short_desc: AI 安全生图与 GPT Image 2.6 GIF 动图，均支持参考图、统一图库、个人画廊和内置管理页。
 desc: 通过 UUAPI Images API 提供审核、限流、任务隔离、人物/引用图和 QQ 单一本体参考图；静态图与 GIF 共用永久图库编号，画廊显示动图首帧，管理页支持动画预览、GIF 筛选、编辑、回收站与插件配置。
-version: "0.3.3"
+version: "0.3.4"
 author: Rio
 repo: "https://github.com/RioMaker/astrbot_plugin_img_gener"
 astrbot_version: ">=4.13.0"

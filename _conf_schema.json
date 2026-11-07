@@ -83,7 +83,7 @@
           "竖图 1024×1536",
           "横图 1536×1024"
         ],
-        "hint": "LLM 或 /生图 未指定尺寸时使用此值；新安装默认使用较小的 816×816。"
+        "hint": "generate_image 或 /生图 未指定尺寸时使用此值；新安装默认使用较小的 816×816。GIF 使用「GIF 动图」中的独立尺寸。"
       },
       "allowed_sizes": {
         "description": "允许使用的尺寸",
@@ -100,7 +100,7 @@
         "items": {
           "type": "string"
         },
-        "hint": "限制 LLM 工具可额外选择的尺寸；默认尺寸始终有效，/生图 始终使用默认尺寸。"
+        "hint": "限制静态图 generate_image 工具可额外选择的尺寸；默认尺寸始终有效，/生图 始终使用默认尺寸。"
       },
       "default_quality": {
         "description": "默认质量",
@@ -143,7 +143,7 @@
   "animation": {
     "description": "GIF 动图",
     "type": "object",
-    "hint": "/生动图 使用独立参数，与普通生图共用 API 地址、密钥、审核和额度。UUAPI 一个 GIF 按一张图计费，1K 档以下不保证继续降价。",
+    "hint": "/生动图 与 AI 工具 generate_gif 使用这组独立参数，均支持人物、本体和引用参考图，与普通生图共用 API 地址、密钥、审核和额度。UUAPI 一个 GIF 按一张图计费，1K 档以下不保证继续降价。",
     "items": {
       "model": {
         "description": "动图模型",
@@ -957,7 +957,7 @@
         "description": "携带引用消息中的图片",
         "type": "bool",
         "default": true,
-        "hint": "开启后，回复或引用一条含图片的历史消息再要求生图时，会把引用链中的图片作为额外参考图上传。"
+        "hint": "开启后，回复或引用含图片的历史消息再要求静态图或 GIF 时，命令与 AI 工具都会读取并携带引用图；不自动携带当前消息直接附加的图片。"
       },
       "max_quoted_images": {
         "description": "单次最多引用历史图片",

@@ -72,6 +72,7 @@ def test_agent_vitepress_document_tracks_public_capabilities() -> None:
     assert "每次修改功能、命令、LLM 工具" in document
     for capability in (
         "generate_image",
+        "generate_gif",
         "get_image_generation_status",
         "get_user_portrait_reference",
         "/生图 <提示词>",

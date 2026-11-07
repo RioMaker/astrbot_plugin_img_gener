@@ -481,7 +481,10 @@ class Event:
         self.sent.append(value)
 
 
-def test_gif_command_queue_freezes_options_and_history_returns_original(gif_plugin, gif_content):
+@pytest.mark.parametrize("entrypoint", ["gif_command", "generate_gif"])
+def test_gif_command_queue_freezes_options_and_history_returns_original(
+    gif_plugin, gif_content, entrypoint
+):
     module, plugin = gif_plugin
     plugin.config["animation"] = {"timeout_seconds": 720}
     captured = []
@@ -495,9 +498,17 @@ def test_gif_command_queue_freezes_options_and_history_returns_original(gif_plug
 
     async def scenario():
         event = Event()
-        result = [item async for item in plugin.gif_command(event, "猫挥手，无缝循环")]
-        assert event.stopped and "16 帧 · 40ms/帧" in result[0] and "512x512" in result[0]
-        assert next(iter(plugin._active_jobs.values())).source == "/生动图"
+        if entrypoint == "gif_command":
+            notice = await anext(plugin.gif_command(event, "猫挥手，无缝循环"))
+            assert event.stopped
+            source = "/生动图"
+        else:
+            notice = await plugin.generate_gif(event, "猫挥手，无缝循环")
+            assert not event.stopped
+            source = "LLM GIF"
+        assert "16 帧 · 40ms/帧" in notice and "512x512" in notice
+        assert "任务标识：#1 / P-" in notice
+        assert next(iter(plugin._active_jobs.values())).source == source
         plugin.config["animation"] = {"frame_count": 8, "size": "1024x1024"}
         await asyncio.gather(*plugin._background_tasks)
         assert captured[0]["animation"] == GifOptions(timeout_seconds=720)
@@ -536,8 +547,9 @@ def test_gif_reference_is_static_first_frame_and_portrait_can_be_reused(
     assert quoted[0][2] == "image/png"
 
 
+@pytest.mark.parametrize("entrypoint", ["gif_command", "generate_gif"])
 @pytest.mark.parametrize("failure", ["local_review", "remote_review", "upstream"])
-def test_gif_failures_do_not_archive_or_consume_generation_quota(gif_plugin, failure):
+def test_gif_failures_do_not_archive_or_consume_generation_quota(gif_plugin, failure, entrypoint):
     module, plugin = gif_plugin
     calls = []
     if failure == "local_review":
@@ -562,9 +574,12 @@ def test_gif_failures_do_not_archive_or_consume_generation_quota(gif_plugin, fai
 
     async def scenario():
         event = Event()
-        replies = [item async for item in plugin.gif_command(event, prompt)]
+        if entrypoint == "gif_command":
+            notice = await anext(plugin.gif_command(event, prompt))
+        else:
+            notice = await plugin.generate_gif(event, prompt)
         if failure == "local_review":
-            assert "未通过" in replies[0] and not plugin._background_tasks
+            assert "未通过" in notice and not plugin._background_tasks
         await asyncio.gather(*plugin._background_tasks)
         assert bool(calls) == (failure == "upstream")
         assert plugin.gallery_store.count() == 0 and not plugin._active_jobs
@@ -575,10 +590,12 @@ def test_gif_failures_do_not_archive_or_consume_generation_quota(gif_plugin, fai
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("entrypoint", ["gif_command", "generate_gif"])
 def test_gif_generation_with_quoted_reference_uses_edit_and_retains_snapshot(
     gif_plugin,
     gif_content,
     tmp_path,
+    entrypoint,
 ):
     module, plugin = gif_plugin
     path = tmp_path / "quoted.png"
@@ -598,11 +615,195 @@ def test_gif_generation_with_quoted_reference_uses_edit_and_retains_snapshot(
 
     async def scenario():
         event = Event([module.Comp.Reply(chain=[module.Comp.Image(str(path))])])
-        await anext(plugin.gif_command(event, "参考图里的猫挥手"))
+        if entrypoint == "gif_command":
+            await anext(plugin.gif_command(event, "参考图里的猫挥手"))
+        else:
+            await plugin.generate_gif(event, "参考图里的猫挥手")
         path.write_bytes(b"replaced after submission")
         await asyncio.gather(*plugin._background_tasks)
         assert calls[0][0][0][1] == reference
         assert calls[0][1]["animation"] == GifOptions()
         assert plugin.gallery_store.get(1).is_animated
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("tool_name", ["generate_image", "generate_gif"])
+@pytest.mark.parametrize("reference_format", ["png", "gif"])
+def test_ai_reference_reaches_edit_request(
+    gif_plugin, gif_content, tmp_path, monkeypatch, tool_name, reference_format
+):
+    module, plugin = gif_plugin
+    reference = first_frame_png(gif_content)
+    path = tmp_path / f"quoted.{reference_format}"
+    path.write_bytes(gif_content if reference_format == "gif" else reference)
+    animated = tool_name == "generate_gif"
+    output = gif_content if animated else reference
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        return httpx.Response(200, json={"data": [{"b64_json": base64.b64encode(output).decode()}]})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kw: real_client(transport=httpx.MockTransport(respond), **kw),
+    )
+    plugin.config["api"] = {"base_url": "https://example.test/v1", "api_key": "test"}
+
+    async def scenario():
+        # The unrelated direct attachment must not be read or mixed into the task.
+        event = Event(
+            [
+                module.Comp.Reply(chain=[module.Comp.Image(str(path))]),
+                module.Comp.Image(str(tmp_path / "unrelated.png")),
+            ]
+        )
+        notice = await getattr(plugin, tool_name)(event, "引用图里的猫眨眼，保持原有外观")
+        assert "任务标识：#1 / P-" in notice
+        await asyncio.gather(*plugin._background_tasks)
+        assert len(requests) == 1
+        request = requests[0]
+        assert request.url.path == "/v1/images/edits"
+        assert reference in request.content
+        assert b'name="image"; filename="reference_01_user_quote_01.png"' in request.content
+        assert b"REF-01" in request.content
+        assert b"unrelated" not in request.content
+        if animated:
+            for key, value in GifOptions().request_fields().items():
+                assert f'name="{key}"\r\n\r\n{value}\r\n'.encode() in request.content
+        else:
+            assert b'name="model"\r\n\r\ngpt-image-2\r\n' in request.content
+            assert b'name="frame_count"' not in request.content
+        record = plugin.gallery_store.get(1)
+        assert record.is_animated == animated
+        assert record.image_path.read_bytes() == output
+        assert not plugin._active_jobs
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("tool_name", ["generate_image", "generate_gif"])
+@pytest.mark.parametrize("reference_mode", ["multi", "auto"])
+def test_ai_tools_keep_character_portrait_and_quoted_references(
+    gif_plugin, gif_content, tmp_path, tool_name, reference_mode
+):
+    module, plugin = gif_plugin
+    character_path = tmp_path / "character.png"
+    portrait_path = tmp_path / "portrait.png"
+    quoted_path = tmp_path / "quoted.png"
+    colors = [(0, 255, 0), (0, 0, 255), (255, 0, 0)]
+    paths = [character_path, portrait_path, quoted_path]
+    for path, color in zip(paths, colors, strict=True):
+        Image.new("RGB", (64, 64), color).save(path)
+    plugin.references = module.CharacterReferenceManager(
+        [{"name": "可可子", "reference_images": [str(character_path)]}],
+        data_dir=tmp_path,
+        plugin_dir=tmp_path,
+    )
+    plugin.config["references"] = {"reference_mode": reference_mode}
+    plugin.user_profiles.ensure_profile("123", display_name="动图用户")
+    plugin.user_profiles.set_manual_reference(
+        "123", content=portrait_path.read_bytes(), extension=".png"
+    )
+    calls = []
+
+    class Client:
+        async def edit(self, prompt, sources, **kwargs):
+            calls.append((prompt, sources, kwargs))
+            if tool_name == "generate_gif":
+                return ImageResponse(gif_content, "image/gif")
+            return ImageResponse(first_frame_png(gif_content), "image/png")
+
+        async def generate(self, *args, **kwargs):
+            raise AssertionError("available references must use edits")
+
+    class PortraitEvent(Event):
+        def get_message_str(self):
+            return "让可可子和我一起挥手，背景参考引用图"
+
+    plugin._client = lambda: Client()
+
+    async def scenario():
+        event = PortraitEvent([module.Comp.Reply(chain=[module.Comp.Image(str(quoted_path))])])
+        await getattr(plugin, tool_name)(
+            event, "两人并排挥手，保持各自参考图的外观，背景参考引用图", portrait_user_qqs=["self"]
+        )
+        await asyncio.gather(*plugin._background_tasks)
+        assert len(calls) == 1
+        prompt, sources, kwargs = calls[0]
+        assert all(label in prompt for label in ("REF-01", "REF-02", "REF-03", "可可子", "123"))
+        assert "角色「123」" in next(line for line in prompt.splitlines() if "- REF-01" in line)
+        assert "角色「可可子」" in next(line for line in prompt.splitlines() if "- REF-02" in line)
+        if reference_mode == "multi":
+            assert [source[1] for source in sources] == [
+                path.read_bytes() for path in (portrait_path, character_path, quoted_path)
+            ]
+        else:
+            assert len(sources) == 1 and sources[0][0] == "contact_sheet_REF_map.png"
+            with Image.open(io.BytesIO(sources[0][1])) as sheet:
+                pixels = set(sheet.convert("RGB").getdata())
+                assert all(color in pixels for color in colors)
+        assert kwargs.get("animation") == (GifOptions() if tool_name == "generate_gif" else None)
+        assert plugin.gallery_store.get(1).is_animated == (tool_name == "generate_gif")
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("tool_name", ["generate_image", "generate_gif"])
+@pytest.mark.parametrize("failure", ["missing", "unsupported", "too_many"])
+def test_ai_tools_reject_unusable_quoted_references_before_queueing(
+    gif_plugin, gif_content, tmp_path, tool_name, failure
+):
+    module, plugin = gif_plugin
+    path = tmp_path / "quoted.png"
+    if failure == "unsupported":
+        path.write_bytes(b"not an image")
+    elif failure == "too_many":
+        path.write_bytes(first_frame_png(gif_content))
+    images = [module.Comp.Image(str(path))] * (3 if failure == "too_many" else 1)
+    expected = {
+        "missing": "已失效或无法读取",
+        "unsupported": "格式不受支持",
+        "too_many": "最多使用 2 张",
+    }
+
+    def unexpected_client():
+        raise AssertionError("a broken reference must not fall back to text-only generation")
+
+    plugin._client = unexpected_client
+
+    async def scenario():
+        notice = await getattr(plugin, tool_name)(
+            Event([module.Comp.Reply(chain=images)]), "引用图里的猫挥手"
+        )
+        assert expected[failure] in notice
+        assert not plugin._background_tasks and not plugin._active_jobs
+        assert plugin.gallery_store.count() == 0
+        rate = await plugin.rate_limiter.acquire("qq:123", "qq:456")
+        assert rate.allowed
+        await plugin.rate_limiter.cancel(rate.lease_id)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failure", ["english", "settings", "permission"])
+def test_gif_tool_rejects_invalid_requests_before_queueing(gif_plugin, failure):
+    module, plugin = gif_plugin
+    prompt = "猫挥手"
+    if failure == "english":
+        prompt = "A cat waves."
+    elif failure == "settings":
+        plugin.config["animation"] = {"frame_count": 100}
+    else:
+        plugin._is_allowed = lambda event: False
+
+    async def scenario():
+        notice = await plugin.generate_gif(Event(), prompt)
+        expected = {"english": "generate_gif", "settings": "GIF 帧数", "permission": "没有使用权限"}
+        assert expected[failure] in notice
+        assert not plugin._background_tasks and not plugin._active_jobs
 
     asyncio.run(scenario())
