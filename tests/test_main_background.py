@@ -152,9 +152,11 @@ def test_llm_tool_returns_before_background_generation_finishes() -> None:
 
 
 @pytest.mark.parametrize("tool_name", ["generate_image", "generate_gif"])
+@pytest.mark.parametrize("reference_kind", ["quote", "attachment"])
 def test_consecutive_group_jobs_keep_owner_route_prompt_and_image_snapshot(
     tmp_path,
     tool_name,
+    reference_kind,
 ) -> None:
     async def scenario() -> None:
         _install_astrbot_stubs()
@@ -213,7 +215,7 @@ def test_consecutive_group_jobs_keep_owner_route_prompt_and_image_snapshot(
                     "group_id": event.get_group_id(),
                     "origin": event.unified_msg_origin,
                     "prompt": prompt,
-                    "quoted": kwargs["quoted_image_sources"],
+                    "images": kwargs["message_image_sources"],
                     "reference_prompt": kwargs["reference_prompt"],
                 }
             )
@@ -226,6 +228,10 @@ def test_consecutive_group_jobs_keep_owner_route_prompt_and_image_snapshot(
         second_image = tmp_path / "second.png"
         second_image.write_bytes(b"\x89PNG\r\n\x1a\nsecond-user")
 
+        def image_component(path):
+            component = module.Comp.Image(str(path))
+            return module.Comp.Reply(chain=[component]) if reference_kind == "quote" else component
+
         class MutableEvent:
             def __init__(self):
                 self.sender_id = "10001"
@@ -233,11 +239,7 @@ def test_consecutive_group_jobs_keep_owner_route_prompt_and_image_snapshot(
                 self.group_id = "200"
                 self.unified_msg_origin = "qq:GroupMessage:200"
                 self.message_text = "用户甲的红色列车请求"
-                self.messages = [
-                    module.Comp.Reply(
-                        chain=[module.Comp.Image(str(first_image))]
-                    )
-                ]
+                self.messages = [image_component(first_image)]
 
             def get_platform_name(self):
                 return "qq"
@@ -269,9 +271,7 @@ def test_consecutive_group_jobs_keep_owner_route_prompt_and_image_snapshot(
         event.sender_name = "用户乙"
         event.unified_msg_origin = "qq:GroupMessage:200"
         event.message_text = "用户乙的蓝色帆船请求"
-        event.messages = [
-            module.Comp.Reply(chain=[module.Comp.Image(str(second_image))])
-        ]
+        event.messages = [image_component(second_image)]
         release_resolution.set()
         first_notice = await first_request
         second_notice = await getattr(plugin, tool_name)(
@@ -286,12 +286,12 @@ def test_consecutive_group_jobs_keep_owner_route_prompt_and_image_snapshot(
         by_sender = {item["sender_id"]: item for item in captured}
         assert by_sender["10001"]["origin"] == "qq:GroupMessage:200"
         assert by_sender["10001"]["prompt"] == "红色列车驶过雪山，电影感构图"
-        assert by_sender["10001"]["quoted"][0][1].endswith(b"first-user")
+        assert by_sender["10001"]["images"][0][1].endswith(b"first-user")
         assert "用户甲的红色列车请求" in by_sender["10001"]["reference_prompt"]
         assert "用户乙的蓝色帆船请求" not in by_sender["10001"]["reference_prompt"]
         assert by_sender["10002"]["origin"] == "qq:GroupMessage:200"
         assert by_sender["10002"]["prompt"] == "蓝色帆船穿过海湾，清晨薄雾"
-        assert by_sender["10002"]["quoted"][0][1].endswith(b"second-user")
+        assert by_sender["10002"]["images"][0][1].endswith(b"second-user")
         assert {origin for origin, _message in plugin.context.sent} == {
             "qq:GroupMessage:200"
         }
@@ -510,14 +510,15 @@ def test_quoted_reply_images_are_loaded_as_reference_sources(tmp_path) -> None:
         assert sources == [
             ("quoted_1.png", image_path.read_bytes(), "image/png")
         ]
-        augmented = plugin._augment_quoted_reference_prompt(
+        augmented = plugin._augment_message_reference_prompt(
             "雨夜街道",
             start_index=2,
             count=1,
             use_sheet=True,
+            source_labels=("引用历史消息图",),
         )
         assert "REF-02（拼合图第 2 格）" in augmented
-        assert "用户引用的历史聊天图片" in augmented
+        assert "引用历史消息图" in augmented
 
     asyncio.run(scenario())
 
@@ -743,7 +744,7 @@ def test_generation_uploads_quoted_reply_image(tmp_path) -> None:
         assert result is None
         assert captured["sources"][0][0] == "reference_01_user_quote_01.png"
         assert captured["sources"][0][1] == quoted_path.read_bytes()
-        assert "用户引用图片映射" in captured["prompt"]
+        assert "用户消息参考图映射" in captured["prompt"]
         assert "REF-01（文件 reference_01_user_quote_01.png）" in captured["prompt"]
         assert plugin.rate_limiter.completed == ["lease-1"]
         assert plugin.rate_limiter.canceled == []

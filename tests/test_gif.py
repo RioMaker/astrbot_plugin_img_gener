@@ -543,7 +543,7 @@ def test_gif_reference_is_static_first_frame_and_portrait_can_be_reused(
     with Image.open(io.BytesIO(sources[0][1])) as image:
         assert image.convert("RGB").getpixel((32, 32)) == (255, 0, 0)
     event = Event([module.Comp.Reply(chain=[module.Comp.Image(str(record.image_path))])])
-    quoted = asyncio.run(plugin._capture_quoted_reference_sources(event))
+    quoted = asyncio.run(plugin._capture_message_reference_sources(event))
     assert quoted[0][2] == "image/png"
 
 
@@ -591,11 +591,13 @@ def test_gif_failures_do_not_archive_or_consume_generation_quota(gif_plugin, fai
 
 
 @pytest.mark.parametrize("entrypoint", ["gif_command", "generate_gif"])
+@pytest.mark.parametrize("reference_kind", ["quote", "attachment"])
 def test_gif_generation_with_quoted_reference_uses_edit_and_retains_snapshot(
     gif_plugin,
     gif_content,
     tmp_path,
     entrypoint,
+    reference_kind,
 ):
     module, plugin = gif_plugin
     path = tmp_path / "quoted.png"
@@ -614,7 +616,10 @@ def test_gif_generation_with_quoted_reference_uses_edit_and_retains_snapshot(
     plugin._client = lambda: Client()
 
     async def scenario():
-        event = Event([module.Comp.Reply(chain=[module.Comp.Image(str(path))])])
+        component = module.Comp.Image(str(path))
+        event = Event(
+            [module.Comp.Reply(chain=[component]) if reference_kind == "quote" else component]
+        )
         if entrypoint == "gif_command":
             await anext(plugin.gif_command(event, "参考图里的猫挥手"))
         else:
@@ -628,16 +633,19 @@ def test_gif_generation_with_quoted_reference_uses_edit_and_retains_snapshot(
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("tool_name", ["generate_image", "generate_gif"])
+@pytest.mark.parametrize(
+    "entrypoint", ["generate_image", "generate_gif", "draw_command", "gif_command"]
+)
 @pytest.mark.parametrize("reference_format", ["png", "gif"])
-def test_ai_reference_reaches_edit_request(
-    gif_plugin, gif_content, tmp_path, monkeypatch, tool_name, reference_format
+@pytest.mark.parametrize("reference_kind", ["quote", "attachment"])
+def test_message_reference_reaches_edit_request(
+    gif_plugin, gif_content, tmp_path, monkeypatch, entrypoint, reference_format, reference_kind
 ):
     module, plugin = gif_plugin
     reference = first_frame_png(gif_content)
     path = tmp_path / f"quoted.{reference_format}"
     path.write_bytes(gif_content if reference_format == "gif" else reference)
-    animated = tool_name == "generate_gif"
+    animated = entrypoint in {"generate_gif", "gif_command"}
     output = gif_content if animated else reference
     requests = []
 
@@ -654,23 +662,25 @@ def test_ai_reference_reaches_edit_request(
     plugin.config["api"] = {"base_url": "https://example.test/v1", "api_key": "test"}
 
     async def scenario():
-        # The unrelated direct attachment must not be read or mixed into the task.
+        component = module.Comp.Image(str(path))
         event = Event(
-            [
-                module.Comp.Reply(chain=[module.Comp.Image(str(path))]),
-                module.Comp.Image(str(tmp_path / "unrelated.png")),
-            ]
+            [module.Comp.Reply(chain=[component]) if reference_kind == "quote" else component]
         )
-        notice = await getattr(plugin, tool_name)(event, "引用图里的猫眨眼，保持原有外观")
+        request = getattr(plugin, entrypoint)(event, "参考图里的猫眨眼，保持原有外观")
+        notice = await anext(request) if entrypoint.endswith("_command") else await request
         assert "任务标识：#1 / P-" in notice
         await asyncio.gather(*plugin._background_tasks)
         assert len(requests) == 1
         request = requests[0]
         assert request.url.path == "/v1/images/edits"
         assert reference in request.content
-        assert b'name="image"; filename="reference_01_user_quote_01.png"' in request.content
+        assert (
+            f'name="image"; filename="reference_01_user_{reference_kind}_01.png"'.encode()
+            in request.content
+        )
         assert b"REF-01" in request.content
-        assert b"unrelated" not in request.content
+        label = "当前消息附件图" if reference_kind == "attachment" else "引用历史消息图"
+        assert label.encode() in request.content
         if animated:
             for key, value in GifOptions().request_fields().items():
                 assert f'name="{key}"\r\n\r\n{value}\r\n'.encode() in request.content
@@ -687,15 +697,16 @@ def test_ai_reference_reaches_edit_request(
 
 @pytest.mark.parametrize("tool_name", ["generate_image", "generate_gif"])
 @pytest.mark.parametrize("reference_mode", ["multi", "auto"])
-def test_ai_tools_keep_character_portrait_and_quoted_references(
+def test_ai_tools_keep_character_portrait_attached_and_quoted_references(
     gif_plugin, gif_content, tmp_path, tool_name, reference_mode
 ):
     module, plugin = gif_plugin
     character_path = tmp_path / "character.png"
     portrait_path = tmp_path / "portrait.png"
     quoted_path = tmp_path / "quoted.png"
-    colors = [(0, 255, 0), (0, 0, 255), (255, 0, 0)]
-    paths = [character_path, portrait_path, quoted_path]
+    attached_path = tmp_path / "attached.png"
+    colors = [(0, 255, 0), (0, 0, 255), (255, 0, 0), (255, 255, 0)]
+    paths = [character_path, portrait_path, quoted_path, attached_path]
     for path, color in zip(paths, colors, strict=True):
         Image.new("RGB", (64, 64), color).save(path)
     plugin.references = module.CharacterReferenceManager(
@@ -727,19 +738,29 @@ def test_ai_tools_keep_character_portrait_and_quoted_references(
     plugin._client = lambda: Client()
 
     async def scenario():
-        event = PortraitEvent([module.Comp.Reply(chain=[module.Comp.Image(str(quoted_path))])])
+        event = PortraitEvent(
+            [
+                module.Comp.Reply(chain=[module.Comp.Image(str(quoted_path))]),
+                module.Comp.Image(str(attached_path)),
+            ]
+        )
         await getattr(plugin, tool_name)(
             event, "两人并排挥手，保持各自参考图的外观，背景参考引用图", portrait_user_qqs=["self"]
         )
         await asyncio.gather(*plugin._background_tasks)
         assert len(calls) == 1
         prompt, sources, kwargs = calls[0]
-        assert all(label in prompt for label in ("REF-01", "REF-02", "REF-03", "可可子", "123"))
+        assert all(
+            label in prompt for label in ("REF-01", "REF-02", "REF-03", "REF-04", "可可子", "123")
+        )
         assert "角色「123」" in next(line for line in prompt.splitlines() if "- REF-01" in line)
         assert "角色「可可子」" in next(line for line in prompt.splitlines() if "- REF-02" in line)
+        assert "当前消息附件图" in next(line for line in prompt.splitlines() if "- REF-03" in line)
+        assert "引用历史消息图" in next(line for line in prompt.splitlines() if "- REF-04" in line)
         if reference_mode == "multi":
             assert [source[1] for source in sources] == [
-                path.read_bytes() for path in (portrait_path, character_path, quoted_path)
+                path.read_bytes()
+                for path in (portrait_path, character_path, attached_path, quoted_path)
             ]
         else:
             assert len(sources) == 1 and sources[0][0] == "contact_sheet_REF_map.png"
@@ -748,14 +769,19 @@ def test_ai_tools_keep_character_portrait_and_quoted_references(
                 assert all(color in pixels for color in colors)
         assert kwargs.get("animation") == (GifOptions() if tool_name == "generate_gif" else None)
         assert plugin.gallery_store.get(1).is_animated == (tool_name == "generate_gif")
+        completion = "".join(
+            getattr(part, "text", "") for message in event.sent for part in message.chain
+        )
+        assert "当前附件：1 张" in completion and "引用图片：1 张" in completion
 
     asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("tool_name", ["generate_image", "generate_gif"])
 @pytest.mark.parametrize("failure", ["missing", "unsupported", "too_many"])
-def test_ai_tools_reject_unusable_quoted_references_before_queueing(
-    gif_plugin, gif_content, tmp_path, tool_name, failure
+@pytest.mark.parametrize("reference_kind", ["quote", "attachment"])
+def test_ai_tools_reject_unusable_message_references_before_queueing(
+    gif_plugin, gif_content, tmp_path, tool_name, failure, reference_kind
 ):
     module, plugin = gif_plugin
     path = tmp_path / "quoted.png"
@@ -763,11 +789,12 @@ def test_ai_tools_reject_unusable_quoted_references_before_queueing(
         path.write_bytes(b"not an image")
     elif failure == "too_many":
         path.write_bytes(first_frame_png(gif_content))
-    images = [module.Comp.Image(str(path))] * (3 if failure == "too_many" else 1)
+    too_many_count = 3 if reference_kind == "quote" else 5
+    images = [module.Comp.Image(str(path))] * (too_many_count if failure == "too_many" else 1)
     expected = {
         "missing": "已失效或无法读取",
         "unsupported": "格式不受支持",
-        "too_many": "最多使用 2 张",
+        "too_many": "最多使用 2 张" if reference_kind == "quote" else "超过单次参考图上限 4 张",
     }
 
     def unexpected_client():
@@ -777,7 +804,8 @@ def test_ai_tools_reject_unusable_quoted_references_before_queueing(
 
     async def scenario():
         notice = await getattr(plugin, tool_name)(
-            Event([module.Comp.Reply(chain=images)]), "引用图里的猫挥手"
+            Event([module.Comp.Reply(chain=images)] if reference_kind == "quote" else images),
+            "参考图里的猫挥手",
         )
         assert expected[failure] in notice
         assert not plugin._background_tasks and not plugin._active_jobs

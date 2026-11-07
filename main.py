@@ -1190,26 +1190,16 @@ class GPTImageGeneratorPlugin(Star):
 
         if not self._bool("references", "enable_quoted_images", default=True):
             return ()
-        getter = getattr(event, "get_messages", None)
-        try:
-            chain = getter() if callable(getter) else event.message_obj.message
-        except Exception:
-            return ()
-        reply_cls = getattr(Comp, "Reply", None)
-        image_cls = getattr(Comp, "Image", None)
-        if reply_cls is None or image_cls is None:
-            return ()
-        images: list[Any] = []
-        for segment in chain or ():
-            if not isinstance(segment, reply_cls):
-                continue
-            for quoted_segment in getattr(segment, "chain", None) or ():
-                if isinstance(quoted_segment, image_cls):
-                    images.append(quoted_segment)
-        return tuple(images)
+        return self._event_image_components(event, include_attached=False)
 
-    def _event_image_components(self, event: AstrMessageEvent) -> tuple[Any, ...]:
-        """Return direct and replied Image components for profile replacement."""
+    def _event_image_components(
+        self,
+        event: AstrMessageEvent | FrozenGenerationEvent,
+        *,
+        include_attached: bool = True,
+        include_quoted: bool = True,
+    ) -> tuple[Any, ...]:
+        """Select current attachments and/or reply images without reading bytes."""
 
         getter = getattr(event, "get_messages", None)
         try:
@@ -1223,11 +1213,12 @@ class GPTImageGeneratorPlugin(Star):
         images: list[Any] = []
         for segment in chain or ():
             if isinstance(segment, image_cls):
-                images.append(segment)
+                if include_attached:
+                    images.append(segment)
                 continue
             is_reply = bool(reply_cls is not None and isinstance(segment, reply_cls))
             is_reply = is_reply or type(segment).__name__.casefold() == "reply"
-            if not is_reply:
+            if not include_quoted or not is_reply:
                 continue
             for quoted_segment in getattr(segment, "chain", None) or ():
                 if isinstance(quoted_segment, image_cls):
@@ -1244,9 +1235,7 @@ class GPTImageGeneratorPlugin(Star):
             return "image/jpeg", ".jpg"
         if content.startswith(b"RIFF") and content[8:12] == b"WEBP":
             return "image/webp", ".webp"
-        raise ImageGeneratorError(
-            f"{source_label}格式不受支持，仅支持 PNG、JPEG 或 WebP。"
-        )
+        raise ImageGeneratorError(f"{source_label}格式不受支持，仅支持 PNG、JPEG 或 WebP。")
 
     async def _load_image_sources(
         self,
@@ -1258,9 +1247,7 @@ class GPTImageGeneratorPlugin(Star):
         """Resolve AstrBot Image components and validate their bytes."""
 
         max_bytes = (
-            self._int("references", "max_image_size_mb", default=12, minimum=1)
-            * 1024
-            * 1024
+            self._int("references", "max_image_size_mb", default=12, minimum=1) * 1024 * 1024
         )
         sources: list[tuple[str, bytes, str]] = []
         for index, component in enumerate(components, start=1):
@@ -1279,9 +1266,7 @@ class GPTImageGeneratorPlugin(Star):
                 if size <= 0:
                     raise OSError("resolved image is empty")
                 if size > max_bytes:
-                    raise ImageGeneratorError(
-                        f"{source_label}超过单张大小上限，请压缩后重新发送。"
-                    )
+                    raise ImageGeneratorError(f"{source_label}超过单张大小上限，请压缩后重新发送。")
                 content = await asyncio.to_thread(path.read_bytes)
             except ImageGeneratorError:
                 raise
@@ -1294,9 +1279,7 @@ class GPTImageGeneratorPlugin(Star):
                 content = await asyncio.to_thread(first_frame_png, content)
                 if len(content) > max_bytes:
                     raise ImageGeneratorError(f"{source_label}的 GIF 首帧超过图片大小上限。")
-            media_type, suffix = self._reference_media_type(
-                content, source_label=source_label
-            )
+            media_type, suffix = self._reference_media_type(content, source_label=source_label)
             sources.append((f"{filename_prefix}_{index}{suffix}", content, media_type))
         return sources
 
@@ -1309,44 +1292,52 @@ class GPTImageGeneratorPlugin(Star):
             filename_prefix="quoted",
         )
 
-    async def _capture_quoted_reference_sources(
+    async def _capture_message_reference_sources(
         self, event: AstrMessageEvent | FrozenGenerationEvent
     ) -> tuple[tuple[str, bytes, str], ...]:
-        """Read quoted images before enqueue so later messages cannot replace them."""
+        """Freeze current attachments, then reply images, before enqueueing."""
 
-        components = self._quoted_image_components(event)
-        if not components:
+        attached = (
+            self._event_image_components(event, include_quoted=False)
+            if self._bool("references", "enable_attached_images", default=True)
+            else ()
+        )
+        quoted = self._quoted_image_components(event)
+        if not attached and not quoted:
             return ()
-        max_quoted_images = self._int(
-            "references", "max_quoted_images", default=2, minimum=1
-        )
-        if len(components) > max_quoted_images:
+        max_quoted_images = self._int("references", "max_quoted_images", default=2, minimum=1)
+        if len(quoted) > max_quoted_images:
             raise ImageGeneratorError(
-                f"单次最多使用 {max_quoted_images} 张引用消息图片，"
-                "请减少引用图片数量后重试。"
+                f"单次最多使用 {max_quoted_images} 张引用消息图片，请减少引用图片数量后重试。"
             )
-        total_limit = int(
-            getattr(getattr(self, "references", None), "max_total_images", 4)
-        )
-        if len(components) > total_limit:
+        total_limit = int(getattr(getattr(self, "references", None), "max_total_images", 4))
+        count = len(attached) + len(quoted)
+        if count > total_limit:
             raise ImageGeneratorError(
-                f"引用消息中有 {len(components)} 张图片，"
+                f"当前消息附件和引用消息共有 {count} 张参考图，"
                 f"超过单次参考图上限 {total_limit} 张。"
             )
-        return tuple(await self._load_quoted_image_sources(components))
+        attached_sources = await self._load_image_sources(
+            attached,
+            source_label="当前消息附带的图片",
+            filename_prefix="attached",
+        )
+        quoted_sources = await self._load_quoted_image_sources(quoted)
+        return (*attached_sources, *quoted_sources)
 
     @staticmethod
-    def _augment_quoted_reference_prompt(
+    def _augment_message_reference_prompt(
         prompt: str,
         *,
         start_index: int,
         count: int,
         use_sheet: bool,
         source_names: tuple[str, ...] = (),
+        source_labels: tuple[str, ...] = (),
     ) -> str:
         if count <= 0:
             return prompt
-        lines = [prompt.rstrip(), "", "用户引用图片映射："]
+        lines = [prompt.rstrip(), "", "用户消息参考图映射："]
         for offset in range(count):
             ref_index = start_index + offset
             ref_id = f"REF-{ref_index:02d}"
@@ -1356,9 +1347,8 @@ class GPTImageGeneratorPlugin(Star):
                 location = f"文件 {source_names[offset]}"
             else:
                 location = f"上传的第 {ref_index} 张参考图"
-            lines.append(
-                f"- {ref_id}（{location}）= 用户引用的历史聊天图片"
-            )
+            label = source_labels[offset] if offset < len(source_labels) else "用户提供的消息参考图"
+            lines.append(f"- {ref_id}（{location}）= {label}")
         lines.append(
             "- 按上方中文生图提示词使用这些 REF；若作为人物参考且提示词未明确要求改变，"
             "尽量保持引用图片中的人物原样，不要自行补充或重新设计其外观。"
@@ -1522,7 +1512,7 @@ class GPTImageGeneratorPlugin(Star):
         characters: tuple[str, ...],
         portrait_user_qqs: tuple[str, ...] = (),
         reference_prompt: str = "",
-        quoted_image_sources: tuple[tuple[str, bytes, str], ...] = (),
+        message_image_sources: tuple[tuple[str, bytes, str], ...] = (),
         job_id: int,
         started_at: float,
         animation: GifOptions | None = None,
@@ -1536,7 +1526,7 @@ class GPTImageGeneratorPlugin(Star):
                 characters=characters,
                 portrait_user_qqs=portrait_user_qqs,
                 reference_prompt=reference_prompt,
-                quoted_image_sources=quoted_image_sources,
+                message_image_sources=message_image_sources,
                 started_at=started_at,
                 job_id=job_id,
                 animation=animation,
@@ -1601,7 +1591,7 @@ class GPTImageGeneratorPlugin(Star):
         characters: list[str] | tuple[str, ...] | None,
         portrait_user_qqs: tuple[str, ...] = (),
         reference_prompt: str = "",
-        quoted_image_sources: tuple[tuple[str, bytes, str], ...] = (),
+        message_image_sources: tuple[tuple[str, bytes, str], ...] = (),
         source: str,
         animation: GifOptions | None = None,
     ) -> int:
@@ -1622,7 +1612,7 @@ class GPTImageGeneratorPlugin(Star):
                     characters=tuple(characters or ()),
                     portrait_user_qqs=portrait_user_qqs,
                     reference_prompt=reference_prompt,
-                    quoted_image_sources=quoted_image_sources,
+                    message_image_sources=message_image_sources,
                     job_id=job_id,
                     started_at=started_at,
                     animation=animation,
@@ -1737,24 +1727,20 @@ class GPTImageGeneratorPlugin(Star):
         *,
         portrait_user_qqs: tuple[str, ...],
     ) -> str | None:
-        if not resolved.image_paths or not self._bool(
-            "references", "strict_references", default=True
-        ):
+        if not self._bool("references", "strict_references", default=True):
             return None
 
         portrait_ids = set(portrait_user_qqs)
         strict_missing = tuple(
-            name
-            for name in resolved.missing_characters
-            if name not in portrait_ids
+            name for name in resolved.missing_characters if name not in portrait_ids
         )
-        if strict_missing:
+        if resolved.image_paths and strict_missing:
             return "人物参考图缺失或不可用：" + "、".join(strict_missing)
         if resolved.capped_characters:
             return (
-                "同时指定的人物超过了单次参考图上限，以下人物未能携带参考图："
+                "人物与消息图片合计超过了单次参考图上限，以下人物未能携带参考图："
                 + "、".join(resolved.capped_characters)
-                + "。请减少同框人物数量，或在插件设置中调大「单次最多携带参考图」。"
+                + "。请减少人物或消息图片数量，或在插件设置中调大「单次最多携带参考图」。"
             )
         return None
 
@@ -1768,7 +1754,7 @@ class GPTImageGeneratorPlugin(Star):
         characters: list[str] | tuple[str, ...] | None = None,
         portrait_user_qqs: tuple[str, ...] = (),
         reference_prompt: str = "",
-        quoted_image_sources: tuple[tuple[str, bytes, str], ...] | None = None,
+        message_image_sources: tuple[tuple[str, bytes, str], ...] | None = None,
         started_at: float | None = None,
         job_id: int | None = None,
         animation: GifOptions | None = None,
@@ -1787,15 +1773,15 @@ class GPTImageGeneratorPlugin(Star):
         except ImageGeneratorError as exc:
             return exc.public_message
 
-        if quoted_image_sources is None:
+        if message_image_sources is None:
             try:
-                raw_quoted_sources = list(
-                    await self._capture_quoted_reference_sources(event)
+                raw_message_sources = list(
+                    await self._capture_message_reference_sources(event)
                 )
             except ImageGeneratorError as exc:
                 return exc.public_message
         else:
-            raw_quoted_sources = list(quoted_image_sources)
+            raw_message_sources = list(message_image_sources)
 
         profile_store = getattr(self, "user_profiles", None)
         profile_references = (
@@ -1805,16 +1791,16 @@ class GPTImageGeneratorPlugin(Star):
         )
         reference_manager = self.references.with_characters(profile_references)
         total_reference_limit = reference_manager.max_total_images
-        if len(raw_quoted_sources) > total_reference_limit:
+        if len(raw_message_sources) > total_reference_limit:
             return (
-                f"引用消息中有 {len(raw_quoted_sources)} 张图片，超过单次参考图上限 "
+                f"消息中有 {len(raw_message_sources)} 张参考图，超过单次参考图上限 "
                 f"{total_reference_limit} 张。"
             )
         requested_characters = [*list(characters or ()), *portrait_user_qqs]
         resolved = reference_manager.resolve(
             "\n".join(item for item in (reference_prompt, raw_prompt) if item),
             requested_characters or None,
-            max_total_images=total_reference_limit - len(raw_quoted_sources),
+            max_total_images=total_reference_limit - len(raw_message_sources),
         )
         reference_error = self._reference_resolution_error(
             resolved,
@@ -1841,18 +1827,21 @@ class GPTImageGeneratorPlugin(Star):
                 resolved.image_paths,
                 labels=resolved.image_character_names,
             )
-            quoted_sources = [
-                (
-                    f"reference_{len(configured_sources) + offset:02d}_"
-                    f"user_quote_{offset:02d}{Path(name).suffix or '.png'}",
-                    content,
-                    media_type,
+            message_sources = []
+            message_labels = []
+            for offset, (name, content, media_type) in enumerate(raw_message_sources, start=1):
+                attached = name.startswith("attached_")
+                source_kind = "attachment" if attached else "quote"
+                message_labels.append("当前消息附件图" if attached else "引用历史消息图")
+                message_sources.append(
+                    (
+                        f"reference_{len(configured_sources) + offset:02d}_"
+                        f"user_{source_kind}_{offset:02d}{Path(name).suffix or '.png'}",
+                        content,
+                        media_type,
+                    )
                 )
-                for offset, (name, content, media_type) in enumerate(
-                    raw_quoted_sources, start=1
-                )
-            ]
-            all_sources = [*configured_sources, *quoted_sources]
+            all_sources = [*configured_sources, *message_sources]
             reference_mode = str(
                 self._get("references", "reference_mode", default="auto") or "auto"
             ).strip().lower()
@@ -1860,7 +1849,7 @@ class GPTImageGeneratorPlugin(Star):
                 reference_mode == "sheet"
                 or (
                     reference_mode == "auto"
-                    and (len(resolved.characters) > 1 or bool(quoted_sources))
+                    and (len(resolved.characters) > 1 or bool(message_sources))
                 )
             ) and len(all_sources) > 1
             sheet = None
@@ -1872,8 +1861,8 @@ class GPTImageGeneratorPlugin(Star):
                     )
                 ]
                 sheet_labels.extend(
-                    f"REF-{len(configured_sources) + index:02d} | 用户引用图 {index}"
-                    for index in range(1, len(quoted_sources) + 1)
+                    f"REF-{len(configured_sources) + index:02d} | {label} {index}"
+                    for index, label in enumerate(message_labels, start=1)
                 )
                 try:
                     sheet = build_contact_sheet_from_sources(
@@ -1891,11 +1880,11 @@ class GPTImageGeneratorPlugin(Star):
                 else all_sources
             )
             logger.info(
-                "[img_gener] reference upload mode=%s files=%s configured=%s quoted=%s",
+                "[img_gener] reference upload mode=%s files=%s configured=%s message_images=%s",
                 "sheet" if use_sheet else "multi",
                 ",".join(name for name, _, _ in sources) or "none",
                 len(configured_sources),
-                len(quoted_sources),
+                len(message_sources),
             )
 
             effective_prompt = CharacterReferenceManager.augment_prompt(
@@ -1906,12 +1895,13 @@ class GPTImageGeneratorPlugin(Star):
                     name for name, _, _ in configured_sources
                 ),
             )
-            effective_prompt = self._augment_quoted_reference_prompt(
+            effective_prompt = self._augment_message_reference_prompt(
                 effective_prompt,
                 start_index=len(configured_sources) + 1,
-                count=len(quoted_sources),
+                count=len(message_sources),
                 use_sheet=use_sheet,
-                source_names=tuple(name for name, _, _ in quoted_sources),
+                source_names=tuple(name for name, _, _ in message_sources),
+                source_labels=tuple(message_labels),
             )
             prompt_prefix = str(
                 self._get("generation", "prompt_prefix", default="") or ""
@@ -1981,8 +1971,12 @@ class GPTImageGeneratorPlugin(Star):
             reference_parts = []
             if resolved.names:
                 reference_parts.append("人物参考：" + "、".join(resolved.names))
-            if quoted_sources:
-                reference_parts.append(f"引用图片：{len(quoted_sources)} 张")
+            attached_count = message_labels.count("当前消息附件图")
+            quoted_count = len(message_labels) - attached_count
+            if attached_count:
+                reference_parts.append(f"当前附件：{attached_count} 张")
+            if quoted_count:
+                reference_parts.append(f"引用图片：{quoted_count} 张")
             reference_text = (
                 "；已携带" + "；".join(reference_parts) if reference_parts else ""
             )
@@ -2182,8 +2176,10 @@ class GPTImageGeneratorPlugin(Star):
         colors, text, and constraints. The plugin performs safety review and rate
         limiting. Configured character names such as 可可子 or 菌菌 are detected
         automatically and their stored reference images are attached.
-        Images contained in a quoted/replied historical message are also attached
-        automatically; describe how those images should guide the result in prompt.
+        Images directly attached to the current message and images in a quoted/
+        replied historical message are attached automatically. The user does not
+        need to reply to an image when attaching it directly. Describe how each
+        reference should guide the result in prompt; do not substitute text for it.
 
         For a portrait of the requester, pass "self" in portrait_user_qqs. For a
         user explicitly mentioned with @, pass that QQ number; the plugin also reads
@@ -2245,13 +2241,13 @@ class GPTImageGeneratorPlugin(Star):
         subjects, motion, composition, style, and loop. Preserve the user's
         constraints; do not copy conversational wrappers or translate to English.
 
-        Configured characters, QQ portrait references, and images in the current
-        message's quoted/replied historical message are attached automatically.
+        Configured characters, QQ portrait references, images directly attached to
+        the current message, and quoted/replied historical images are attached
+        automatically. Direct attachments do not require replying to an image.
         Explain their role in prompt; preserve referenced appearances unless the
         user requests changes. Reference GIFs contribute their first frame only.
-        Direct attachments are not automatically used: ask the user to reply to
-        the image message when they want it used as a reference. Never replace
-        a reference with a text-only description. Do not borrow another sender's
+        Never replace a reference with a text-only description or ask the user to
+        resend a direct attachment as a reply. Do not borrow another sender's
         prompt, reference images, or portrait subjects from group history.
         Use ["self"] for the requester's portrait or confirmed QQ numbers for
         other users. Relay ambiguous identity candidates and wait for confirmation.
@@ -2357,7 +2353,7 @@ class GPTImageGeneratorPlugin(Star):
                 message=local_rejection,
             )
         try:
-            quoted_sources = await self._capture_quoted_reference_sources(frozen_event)
+            message_sources = await self._capture_message_reference_sources(frozen_event)
         except ImageGeneratorError as exc:
             return self._record_rejected_attempt(
                 frozen_event,
@@ -2365,7 +2361,7 @@ class GPTImageGeneratorPlugin(Star):
                 prompt=effective_prompt,
                 size=selected_size,
                 quality=quality,
-                stage="引用图片读取失败",
+                stage="消息参考图读取失败",
                 message=exc.public_message,
             )
         job_id = self._start_background_generation(
@@ -2376,7 +2372,7 @@ class GPTImageGeneratorPlugin(Star):
             characters=frozen_characters,
             portrait_user_qqs=portrait_subjects,
             reference_prompt=reference_prompt,
-            quoted_image_sources=quoted_sources,
+            message_image_sources=message_sources,
             source=source,
             animation=animation,
         )
@@ -2464,7 +2460,7 @@ class GPTImageGeneratorPlugin(Star):
             yield event.plain_result(message)
             return
         try:
-            quoted_sources = await self._capture_quoted_reference_sources(
+            message_sources = await self._capture_message_reference_sources(
                 frozen_event
             )
         except ImageGeneratorError as exc:
@@ -2474,7 +2470,7 @@ class GPTImageGeneratorPlugin(Star):
                 prompt=raw_prompt,
                 size=selected_size,
                 quality=animation.quality if animation else None,
-                stage="引用图片读取失败",
+                stage="消息参考图读取失败",
                 message=exc.public_message,
             )
             yield event.plain_result(message)
@@ -2486,7 +2482,7 @@ class GPTImageGeneratorPlugin(Star):
             quality=animation.quality if animation else None,
             characters=None,
             portrait_user_qqs=portrait_subjects,
-            quoted_image_sources=quoted_sources,
+            message_image_sources=message_sources,
             source=source,
             animation=animation,
         )
