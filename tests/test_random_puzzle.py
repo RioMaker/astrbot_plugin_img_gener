@@ -38,6 +38,47 @@ def test_invalid_counts_are_rejected(argument):
         random_puzzle.parse_puzzle_count(argument)
 
 
+@pytest.mark.parametrize(
+    "argument,expected",
+    [
+        ("233 123", (233, 123)),
+        (" 233\t123\n456 ", (233, 123, 456)),
+        ("233 123 233", (233, 123, 233)),
+        ("001 002", (1, 2)),
+        ("1 9223372036854775807", (1, 9223372036854775807)),
+        (" ".join(map(str, range(1, 21))), tuple(range(1, 21))),
+    ],
+)
+def test_explicit_ids_preserve_order_and_repeats(argument, expected):
+    assert random_puzzle.parse_puzzle_ids(argument) == expected
+
+
+@pytest.mark.parametrize(
+    "argument",
+    [
+        "",
+        " ",
+        "233",
+        "0 1",
+        "-1 2",
+        "+1 2",
+        "1.5 2",
+        "1,2",
+        "[1 2]",
+        "one two",
+        "１ ２",
+        "1 9223372036854775808",
+        "1 " + "9" * 5000,
+        " ".join(["1"] * 21),
+    ],
+)
+def test_invalid_explicit_ids_return_the_selected_command_usage(argument):
+    with pytest.raises(ImageGeneratorError) as error:
+        random_puzzle.parse_puzzle_ids(argument)
+    assert "/拼图" in error.value.public_message
+    assert "/随机拼图" not in error.value.public_message
+
+
 def test_two_images_keep_exact_halves_at_matching_height(tmp_path):
     left = Image.new("RGB", (240, 120), "red")
     ImageDraw.Draw(left).rectangle((120, 0, 239, 119), fill="blue")

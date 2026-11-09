@@ -38,7 +38,7 @@ try:
     from .gif_support import GifOptions, first_frame_png
     from .image_client import OpenAICompatibleImageClient
     from .moderation import PromptModerator
-    from .random_puzzle import build_random_puzzle, parse_puzzle_count
+    from .random_puzzle import build_random_puzzle, parse_puzzle_count, parse_puzzle_ids
     from .rate_limiter import LimitConfig, PersistentRateLimiter
     from .storage import OutputStore
     from .user_profiles import UserProfile, UserProfileStore
@@ -63,7 +63,7 @@ except ImportError:  # pragma: no cover - direct script-style import fallback.
     from gif_support import GifOptions, first_frame_png
     from image_client import OpenAICompatibleImageClient
     from moderation import PromptModerator
-    from random_puzzle import build_random_puzzle, parse_puzzle_count
+    from random_puzzle import build_random_puzzle, parse_puzzle_count, parse_puzzle_ids
     from rate_limiter import LimitConfig, PersistentRateLimiter
     from storage import OutputStore
     from user_profiles import UserProfile, UserProfileStore
@@ -2743,6 +2743,51 @@ class GPTImageGeneratorPlugin(Star):
             return
         yield event.chain_result([Comp.Image.fromFileSystem(str(image_path))])
 
+    async def _save_puzzle(self, records: tuple[GalleryImage, ...]) -> Path:
+        """Share rendering, serialization and temporary storage between puzzle commands."""
+        async with self._gallery_render_lock:
+            sheet = await asyncio.to_thread(
+                build_random_puzzle, tuple(record.image_path for record in records)
+            )
+            return await asyncio.to_thread(self.output_store.save_bytes, sheet.content, ".png")
+
+    @filter.command("拼图")
+    async def puzzle_command(self, event: AstrMessageEvent, query: GreedyStr = ""):
+        """按指定图库编号与输入顺序，使用半幅、宫格或扇形裁切拼接。"""
+        event.stop_event()
+        try:
+            image_ids = parse_puzzle_ids(str(query or ""))
+        except ImageGeneratorError as exc:
+            yield event.plain_result(exc.public_message)
+            return
+        gallery_store = getattr(self, "gallery_store", None)
+        if gallery_store is None:
+            yield event.plain_result("长期图库尚未初始化。")
+            return
+        try:
+            records = await asyncio.to_thread(gallery_store.get_many, image_ids)
+            found = {record.image_id for record in records}
+            missing = tuple(
+                dict.fromkeys(image_id for image_id in image_ids if image_id not in found)
+            )
+            if missing:
+                yield event.plain_result(
+                    "图库中不存在或已删除的编号："
+                    + "、".join(map(str, missing))
+                    + "。请修正编号后重试。"
+                )
+                return
+            image_path = await self._save_puzzle(records)
+        except ImageGeneratorError as exc:
+            logger.warning("[img_gener] selected puzzle failed: %s", exc.detail)
+            yield event.plain_result(exc.public_message)
+            return
+        except Exception:
+            logger.exception("[img_gener] failed to create selected puzzle")
+            yield event.plain_result("拼图失败，请联系管理员查看日志。")
+            return
+        yield event.chain_result([Comp.Image.fromFileSystem(str(image_path))])
+
     @filter.command("随机拼图")
     async def random_puzzle_command(self, event: AstrMessageEvent, query: GreedyStr = ""):
         """随机抽取图库图片，按半幅、宫格或扇形裁切拼接。"""
@@ -2757,20 +2802,14 @@ class GPTImageGeneratorPlugin(Star):
             yield event.plain_result("长期图库尚未初始化。")
             return
         try:
-            async with self._gallery_render_lock:
-                records = await asyncio.to_thread(gallery_store.sample_random, count)
-                if len(records) < count:
-                    yield event.plain_result(
-                        f"图库中只有 {len(records)} 张未删除的图片，"
-                        f"不足以拼接 {count} 张不同图片。"
-                    )
-                    return
-                sheet = await asyncio.to_thread(
-                    build_random_puzzle, tuple(record.image_path for record in records)
+            records = await asyncio.to_thread(gallery_store.sample_random, count)
+            if len(records) < count:
+                yield event.plain_result(
+                    f"图库中只有 {len(records)} 张未删除的图片，"
+                    f"不足以拼接 {count} 张不同图片。"
                 )
-                image_path = await asyncio.to_thread(
-                    self.output_store.save_bytes, sheet.content, ".png"
-                )
+                return
+            image_path = await self._save_puzzle(records)
         except ImageGeneratorError as exc:
             logger.warning("[img_gener] random puzzle failed: %s", exc.detail)
             yield event.plain_result(exc.public_message)
@@ -2806,6 +2845,7 @@ class GPTImageGeneratorPlugin(Star):
                 "随机单图：/生图历史 随机\n"
                 "随机整图宫格：/生图历史 随机 <数量>（2～9）\n"
                 "随机裁切拼图：/随机拼图 [2～20]（默认两张各半幅）\n"
+                "指定裁切拼图：/拼图 233 123（空格分隔，2～20 项）\n"
                 "个人画廊：/画廊，或 /画廊 10 查看本人最近 10 张\n"
                 "指定选图：/画廊 [123 151 488 622]（方括号必填）"
             )

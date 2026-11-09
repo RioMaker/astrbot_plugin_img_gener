@@ -103,7 +103,10 @@ def test_failures_return_safe_messages(gallery_plugin, monkeypatch, stage):
     assert "随机拼图失败" in result[0] and "private" not in result[0]
 
 
-def test_concurrent_renders_are_serialized_off_the_event_loop(gallery_plugin, monkeypatch):
+@pytest.mark.parametrize("mixed_commands", [False, True])
+def test_concurrent_renders_are_serialized_off_the_event_loop(
+    gallery_plugin, monkeypatch, mixed_commands
+):
     module, plugin = gallery_plugin
     add_image(plugin)
     add_image(plugin)
@@ -124,11 +127,13 @@ def test_concurrent_renders_are_serialized_off_the_event_loop(gallery_plugin, mo
 
     monkeypatch.setattr(module, "build_random_puzzle", tracked_render)
 
-    async def invoke():
+    async def invoke(selected=False):
+        if selected:
+            return [result async for result in plugin.puzzle_command(GalleryEvent(), "1 2")]
         return [result async for result in plugin.random_puzzle_command(GalleryEvent())]
 
     async def scenario():
-        return await asyncio.gather(invoke(), invoke(), invoke())
+        return await asyncio.gather(invoke(), invoke(mixed_commands), invoke(mixed_commands))
 
     results = asyncio.run(scenario())
     assert len({result[0][0].path for result in results}) == 3
