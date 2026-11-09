@@ -73,7 +73,7 @@ def test_missing_source_returns_error_and_leaves_no_partial_output(gallery_plugi
     add_image(plugin).image_path.unlink()
 
     async def scenario():
-        return [result async for result in plugin.random_puzzle_command(GalleryEvent())]
+        return [result async for result in plugin.random_puzzle_command(GalleryEvent(), "")]
 
     result = asyncio.run(scenario())
     assert "图库图片缺失" in result[0]
@@ -97,7 +97,7 @@ def test_failures_return_safe_messages(gallery_plugin, monkeypatch, stage):
         monkeypatch.setattr(plugin.output_store, "save_bytes", fail)
 
     async def scenario():
-        return [result async for result in plugin.random_puzzle_command(GalleryEvent())]
+        return [result async for result in plugin.random_puzzle_command(GalleryEvent(), "")]
 
     result = asyncio.run(scenario())
     assert "随机拼图失败" in result[0] and "private" not in result[0]
@@ -130,7 +130,7 @@ def test_concurrent_renders_are_serialized_off_the_event_loop(
     async def invoke(selected=False):
         if selected:
             return [result async for result in plugin.puzzle_command(GalleryEvent(), "1 2")]
-        return [result async for result in plugin.random_puzzle_command(GalleryEvent())]
+        return [result async for result in plugin.random_puzzle_command(GalleryEvent(), "")]
 
     async def scenario():
         return await asyncio.gather(invoke(), invoke(mixed_commands), invoke(mixed_commands))

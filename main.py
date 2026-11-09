@@ -2389,14 +2389,16 @@ class GPTImageGeneratorPlugin(Star):
         return notice
 
     @filter.command("生图", alias={"绘图", "draw"})
-    async def draw_command(self, event: AstrMessageEvent, prompt: GreedyStr = ""):
+    async def draw_command(self, event: AstrMessageEvent, prompt: GreedyStr):
         """直接测试 GPT Image 2 生图；正常聊天也可由 LLM 自动调用。"""
 
+        # GreedyStr must have no Python default: AstrBot otherwise reads only one token.
+        # Bare commands still receive an empty string from CommandFilter.
         async for result in self._draw_command(event, prompt):
             yield result
 
     @filter.command("生动图")
-    async def gif_command(self, event: AstrMessageEvent, prompt: GreedyStr = ""):
+    async def gif_command(self, event: AstrMessageEvent, prompt: GreedyStr):
         """用 GPT Image 2.6 生成 GIF 动图，默认 16 帧、40ms、512×512。"""
 
         async for result in self._draw_command(event, prompt, animated=True):
@@ -2647,7 +2649,7 @@ class GPTImageGeneratorPlugin(Star):
         yield event.plain_result(report)
 
     @filter.command("画廊")
-    async def gallery_command(self, event: AstrMessageEvent, query: GreedyStr = ""):
+    async def gallery_command(self, event: AstrMessageEvent, query: GreedyStr):
         """将本人最近图片或方括号内指定图库编号拼成个人画廊。"""
 
         event.stop_event()
@@ -2752,7 +2754,7 @@ class GPTImageGeneratorPlugin(Star):
             return await asyncio.to_thread(self.output_store.save_bytes, sheet.content, ".png")
 
     @filter.command("拼图")
-    async def puzzle_command(self, event: AstrMessageEvent, query: GreedyStr = ""):
+    async def puzzle_command(self, event: AstrMessageEvent, query: GreedyStr):
         """按指定图库编号与输入顺序，使用半幅、宫格或扇形裁切拼接。"""
         event.stop_event()
         try:
@@ -2789,7 +2791,7 @@ class GPTImageGeneratorPlugin(Star):
         yield event.chain_result([Comp.Image.fromFileSystem(str(image_path))])
 
     @filter.command("随机拼图")
-    async def random_puzzle_command(self, event: AstrMessageEvent, query: GreedyStr = ""):
+    async def random_puzzle_command(self, event: AstrMessageEvent, query: GreedyStr):
         """随机抽取图库图片，按半幅、宫格或扇形裁切拼接。"""
         event.stop_event()
         try:

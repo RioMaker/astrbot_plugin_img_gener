@@ -161,7 +161,7 @@ def test_empty_and_out_of_range_gallery_return_clear_messages(gallery_plugin):
     _module, plugin = gallery_plugin
 
     async def scenario():
-        empty = [result async for result in plugin.gallery_command(GalleryEvent())]
+        empty = [result async for result in plugin.gallery_command(GalleryEvent(), "")]
         add_image(plugin)
         outside = [result async for result in plugin.gallery_command(GalleryEvent(), "-2")]
         return empty, outside
@@ -198,7 +198,7 @@ def test_renderer_error_is_reported_without_raw_exception(gallery_plugin, monkey
     monkeypatch.setattr(module, "build_personal_gallery", fail_render)
 
     async def scenario():
-        return [result async for result in plugin.gallery_command(GalleryEvent())]
+        return [result async for result in plugin.gallery_command(GalleryEvent(), "")]
 
     result = asyncio.run(scenario())
     assert "画廊拼图保存失败" in result[0]
