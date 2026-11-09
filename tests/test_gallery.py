@@ -53,6 +53,27 @@ def test_gallery_random_is_bounded_to_nine(tmp_path) -> None:
     assert len({record.image_id for record in records}) == 9
 
 
+def test_random_sample_supports_twenty_unique_images_and_excludes_recycle_bin(tmp_path):
+    store = GalleryStore(tmp_path / "gallery")
+    for index in range(23):
+        _add(store, requester=str(index), now=100 + index)
+    with store._connect() as connection:
+        connection.execute("UPDATE gallery_images SET deleted_at = 200 WHERE image_id <= 3")
+
+    records = store.sample_random(20)
+
+    assert {record.image_id for record in records} == set(range(4, 24))
+    assert len(records) == 20
+    assert len(store.random(20)) == 9
+
+
+@pytest.mark.parametrize("limit", [-1, 0, 21])
+def test_random_sample_rejects_out_of_range_count(tmp_path, limit):
+    store = GalleryStore(tmp_path / "gallery")
+    with pytest.raises(ValueError):
+        store.sample_random(limit)
+
+
 def test_recent_gallery_filters_requester_across_groups_and_pages_after_reopen(tmp_path) -> None:
     root = tmp_path / "gallery"
     store = GalleryStore(root)

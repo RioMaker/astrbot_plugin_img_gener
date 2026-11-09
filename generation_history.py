@@ -5,7 +5,6 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-
 TERMINAL_STATUSES = {
     "succeeded",
     "rejected",

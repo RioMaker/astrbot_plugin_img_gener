@@ -262,9 +262,15 @@ class GalleryStore:
 
     def random(self, limit: int = 1) -> tuple[GalleryImage, ...]:
         bounded = max(1, min(9, int(limit)))
-        with self._connect() as connection:
+        return self.sample_random(bounded)
+
+    def sample_random(self, limit: int) -> tuple[GalleryImage, ...]:
+        """Sample up to 20 distinct active records without changing legacy random limits."""
+        if not 1 <= limit <= MAX_GALLERY_IMAGES:
+            raise ValueError(f"random sample size must be between 1 and {MAX_GALLERY_IMAGES}")
+        with closing(self._connect()) as connection:
             rows = connection.execute(
                 "SELECT * FROM gallery_images WHERE deleted_at IS NULL ORDER BY RANDOM() LIMIT ?",
-                (bounded,),
+                (limit,),
             ).fetchall()
         return tuple(record for row in rows if (record := self._record(row)) is not None)
