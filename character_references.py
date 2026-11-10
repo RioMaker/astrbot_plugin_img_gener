@@ -310,7 +310,13 @@ class CharacterReferenceManager:
             return prompt
         lines = [prompt.strip()]
         if resolved.image_paths:
-            lines.extend(["", "人物参考图身份映射："])
+            lines.extend([
+                "",
+                "人物参考图身份映射：",
+                "以下为身份定位说明，不是画面文案；除非用户明确要求显示，"
+                "不要把 REF 编号、文件名或拼图标签绘制进成品，"
+                "也不要将人物参考图连同背景整张粘贴进成品。",
+            ])
             for index, character_name in enumerate(
                 resolved.image_character_names, start=1
             ):

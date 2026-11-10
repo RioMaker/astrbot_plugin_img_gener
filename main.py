@@ -1339,7 +1339,13 @@ class GPTImageGeneratorPlugin(Star):
     ) -> str:
         if count <= 0:
             return prompt
-        lines = [prompt.rstrip(), "", "用户消息参考图映射："]
+        lines = [
+            prompt.rstrip(),
+            "",
+            "用户消息参考图映射：",
+            "以下为素材定位说明，不是画面文案；除非用户明确要求显示，"
+            "不要把 REF 编号、文件名或拼图标签绘制进成品。",
+        ]
         for offset in range(count):
             ref_index = start_index + offset
             ref_id = f"REF-{ref_index:02d}"
@@ -1352,7 +1358,8 @@ class GPTImageGeneratorPlugin(Star):
             label = source_labels[offset] if offset < len(source_labels) else "用户提供的消息参考图"
             lines.append(f"- {ref_id}（{location}）= {label}")
         lines.append(
-            "- 按上方中文生图提示词使用这些 REF；若作为人物参考且提示词未明确要求改变，"
+            "- 按上方中文生图提示词区分底图、人物、物体、构图和风格参考；"
+            "参考素材不等于需要整张粘贴进成品。若作为人物参考且提示词未明确要求改变，"
             "尽量保持引用图片中的人物原样，不要自行补充或重新设计其外观。"
         )
         return "\n".join(lines)
@@ -2172,8 +2179,9 @@ class GPTImageGeneratorPlugin(Star):
         For GIFs, animations, or making a referenced image move, use generate_gif
         instead. Never submit a static image while claiming to generate a GIF. First
         rewrite the user's request into a complete, directly usable CHINESE image
-        prompt. Do not copy the conversational message verbatim and do not translate
-        the prompt to English. Remove request wrappers such as “帮我画一张”, while
+        prompt. Do not copy the conversational message verbatim or translate the
+        visual instructions to English. Visible copy is an exception: preserve its
+        original language and exact characters. Remove request wrappers such as “帮我画一张”, while
         preserving requested subjects, composition, actions, style, lighting,
         colors, text, and constraints. The plugin performs safety review and rate
         limiting. Configured character names such as 可可子 or 菌菌 are detected
@@ -2182,6 +2190,30 @@ class GPTImageGeneratorPlugin(Star):
         replied historical message are attached automatically. The user does not
         need to reply to an image when attaching it directly. Describe how each
         reference should guide the result in prompt; do not substitute text for it.
+
+        含文字图片（海报、帮助图、菜单、信息卡等）按需组织以下中文段落；
+        简单插画无需套用长模板，未提供的要求不要凭空补写：
+        【成品目标】说明用途、新建/编辑/合成、画幅方向与比例、整体风格。
+        【输入图片分工】用“当前附件第 N 张”“回复引用第 N 张”或人物名定位，
+        区分待编辑底图与人物身份、物体、构图、风格参考；有主次时说明优先级。
+        人物参考不是待粘贴的海报，不把参考图背景、照片矩形或拼图底栏搬入成品。
+        REF 编号由插件分配，不猜测编号；没有底图时不要声称在编辑现有图片。
+        【修改与保留】分开列明删除、添加、替换和保留内容。删除板块时包括标题、
+        正文、卡片、图标及仅适用于该板块的说明，并重排空位，保留其他有效信息。
+        【人物一致性】只依据实际参考图和用户明确给出的身份事实锁定外观、
+        配饰、服装与画风；按需指定动作和融入方式，不虚构外观或换成相似角色。
+        【布局与可读性】指定信息层级、分区、顺序、网格、角色占比与文字留位；
+        人物和装饰不遮挡文字，已有文字不因加人物而缩小到难读，不留删改空洞。
+        【画面文字（逐字）】把所有指定可见文字单独逐行列出，保留原语言、
+        大小写、斜杠命令、空格、数字、日期、版本、标点、括号和换行，不翻译、
+        润色、纠错或摘要。中文要求只约束绘图说明，英文文案和代码须原样保留。
+        用户给出完整文案时将其作为文字白名单，不增添标题、口号、命令或水印；
+        只有用户要求代拟文案时才拟写，不编造功能、参数和事实。
+        【禁止项】列清用户要求移除或避免的元素；说明区块标题、工具名、文件名、
+        REF 标签及禁止项仅为绘图指令，除非列入可见文案，否则不要画进图片。
+        调用前核对文案无遗漏、参考图角色与顺序无混淆、删除项不再出现在成品中。
+        将以上内容放入现有 prompt 字符串，不新增工具参数，也不要照搬其他平台的
+        “built-in image_gen edit”等执行声明；本工具由插件按实际参考图选择接口。
 
         For a portrait of the requester, pass "self" in portrait_user_qqs. For a
         user explicitly mentioned with @, pass that QQ number; the plugin also reads
@@ -2210,7 +2242,7 @@ class GPTImageGeneratorPlugin(Star):
         not call this generation tool. Call get_image_generation_status instead.
 
         Args:
-            prompt(string): AI-prepared complete Chinese image prompt; never the raw conversational request.
+            prompt(string): Complete Chinese visual instructions; for text-bearing images separate input roles, edits, identity, layout, verbatim visible copy in its original language, and exclusions. Never rewrite the supplied visible copy.
             size(string): Optional allowed output size; use 816x816 for a small fast square draft.
             quality(string): Optional quality: auto, low, medium, or high.
             characters(array): Optional configured character names; omit to auto-detect names and aliases from prompt.
@@ -2241,7 +2273,21 @@ class GPTImageGeneratorPlugin(Star):
         do not send /生动图 as a new message or use generate_image for an animation.
         Rewrite the request into a complete CHINESE prompt describing the desired
         subjects, motion, composition, style, and loop. Preserve the user's
-        constraints; do not copy conversational wrappers or translate to English.
+        constraints; do not copy conversational wrappers or translate visual
+        instructions to English. Preserve visible copy in its original language.
+
+        含文字动图按需分段写明成品目标、输入图片分工、修改与保留、人物一致性、
+        布局与可读性、画面文字（逐字）和禁止项。用“当前附件第 N 张”或
+        “回复引用第 N 张”区分底图与身份/物体/风格参考，不猜测插件 REF 编号，
+        不把人物参考图整张粘贴到成品；没有底图时不要声称编辑已有图片。
+        外观仅依据实际参考和用户明确给出的事实，删除板块时连同附属文字、图标
+        一并去除并重排空位。动作与循环不得遮挡、裁切或扭曲应保持可读的文字。
+        单独逐行列出全部指定可见文案，保留原语言、大小写、空格、数字、斜杠、
+        括号、标点及换行，不翻译、润色或摘要；完整文案作为文字白名单，
+        不擅自添加命令、标题或水印。只有用户要求代拟时才拟写，不编造事实。
+        绘图段落标题、工具名、文件名、REF 标签和禁止项默认不是画面文案。
+        调用前核对文案与素材分工；简单无字动画无需长模板。所有描述放在 prompt，
+        不照搬其他平台的执行声明，不新增参数。
 
         Configured characters, QQ portrait references, images directly attached to
         the current message, and quoted/replied historical images are attached
@@ -2263,7 +2309,7 @@ class GPTImageGeneratorPlugin(Star):
         call get_image_generation_status instead of submitting another task.
 
         Args:
-            prompt(string): AI-prepared complete Chinese animation prompt, including motion and how to use the references.
+            prompt(string): Complete Chinese animation instructions with motion, loop and input roles; for text-bearing GIFs include layout, verbatim visible copy in its original language, and exclusions. Never rewrite the supplied visible copy.
             characters(array): Optional configured character names; omit to auto-detect from the original request and prompt.
             portrait_user_qqs(array): QQ portrait subjects; use ["self"] for the requester or confirmed explicit QQ numbers.
         """  # noqa: E501
@@ -2301,7 +2347,8 @@ class GPTImageGeneratorPlugin(Star):
         if not self._contains_cjk(effective_prompt):
             message = (
                 "请先将用户需求整理成完整、可直接生图的中文提示词，再调用 "
-                f"{tool_name}；不要传入英文提示词，也不要直接复制用户原话。"
+                f"{tool_name}；绘图说明使用中文，不直接复制对话包装；"
+                "图片中需显示的文字请单独逐行列出，保留原语言和原文，不翻译或改写。"
             )
             return self._record_rejected_attempt(
                 frozen_event,
