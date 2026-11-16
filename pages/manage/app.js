@@ -9,6 +9,8 @@ const state = {
   epoch: 0,
   settings: null,
   dirty: false,
+  pingRunning: false,
+  settingsEpoch: 0,
 };
 const cache = new Map();
 const animated = (record) =>
@@ -568,12 +570,48 @@ function field(spec, value, path) {
 function markDirty() {
   state.dirty = true;
   $("settings-state").textContent = "有未保存的修改";
+  updatePingControls();
 }
+function updatePingControls() {
+  $("ping-api").disabled = !state.settings || state.dirty || state.pingRunning;
+  $("ping-api").textContent = state.pingRunning ? "检测中…" : "检测连通性";
+  $("ping-hint").textContent = state.dirty
+    ? "有未保存的修改，请先保存并应用设置，再检测新配置。"
+    : "使用已保存配置；与 /生图ping 共用检测，间隔至少 10 秒。";
+}
+$("ping-api").onclick = async () => {
+  if (!state.settings || state.dirty || state.pingRunning) return;
+  state.pingRunning = true;
+  const epoch = state.settingsEpoch;
+  const target = $("ping-result");
+  target.hidden = false;
+  target.className = "ping-result";
+  target.textContent = "正在检测生图接口，请稍候…";
+  updatePingControls();
+  try {
+    const result = await post("settings/ping", {
+      revision: state.settings.revision,
+    });
+    if (epoch !== state.settingsEpoch) return;
+    target.className = `ping-result ping-${["ok", "warning", "error"].includes(result.status) ? result.status : "warning"}`;
+    target.textContent = result.report;
+  } catch (error) {
+    if (epoch !== state.settingsEpoch) return;
+    target.className = "ping-result ping-error";
+    target.textContent = error.message || "检测失败，请稍后重试。";
+  } finally {
+    state.pingRunning = false;
+    updatePingControls();
+  }
+};
 $("settings-form").addEventListener("input", markDirty);
 $("settings-form").addEventListener("change", markDirty);
 function renderSettings(data) {
+  ++state.settingsEpoch;
   state.settings = data;
   state.dirty = false;
+  $("ping-result").hidden = true;
+  updatePingControls();
   readers = [];
   $("settings-fields").replaceChildren();
   for (const [group, section] of Object.entries(data.schema)) {

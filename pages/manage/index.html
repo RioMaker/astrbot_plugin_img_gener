@@ -110,6 +110,18 @@
             设置保存到 AstrBot
             插件配置，保存后立即生效。运行中的生图完成后才可保存。密钥仅显示设置状态，留空且未勾选替换时保持原值。
           </div>
+          <div class="panel ping-panel" aria-labelledby="ping-title">
+            <h2 id="ping-title">生图连通检测</h2>
+            <p class="muted">
+              检查已保存的生图 API 配置和静态图 / GIF 模型列表，显示响应耗时。
+              不生成图片、不占生图额度；连通不保证实际出图成功。
+            </p>
+            <button id="ping-api" type="button" class="secondary" disabled>
+              检测连通性
+            </button>
+            <p id="ping-hint" class="muted">正在读取配置…</p>
+            <div id="ping-result" role="status" aria-live="polite" hidden></div>
+          </div>
           <form id="settings-form">
             <div id="settings-fields"></div>
             <div class="save-bar">

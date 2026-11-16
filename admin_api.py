@@ -5,6 +5,7 @@ import base64
 import io
 import json
 import uuid
+from dataclasses import asdict
 from functools import wraps
 
 from PIL import Image, ImageOps, UnidentifiedImageError
@@ -37,6 +38,7 @@ class AdminAPI:
             ("images/restore", self.restore, "POST"),
             ("settings", self.get_settings, "GET"),
             ("settings/save", self.save_settings, "POST"),
+            ("settings/ping", self.ping, "POST"),
             ("references/upload", self.upload_reference, "POST"),
         )
         for endpoint, handler, method in routes:
@@ -174,6 +176,15 @@ class AdminAPI:
     async def save_settings(self):
         data = await self.payload()
         return self.response(self.settings.save(data))
+
+    async def ping(self):
+        data = await self.payload()
+        if set(data) != {"revision"}:
+            raise AdminError("检测仅使用已保存配置，请重新读取配置后重试。")
+        if data["revision"] != self.settings.revision():
+            raise AdminError("配置已发生变化，请重新读取后再检测。", 409)
+        result = await self.plugin.ping_image_service()
+        return self.response({**asdict(result), "report": result.report()})
 
     async def upload_reference(self):
         files = await self.web.request.files()

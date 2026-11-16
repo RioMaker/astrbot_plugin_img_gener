@@ -16,6 +16,7 @@ import httpx
 
 from .errors import ImageAPIError
 from .gif_support import GifOptions, first_frame_png, prepare_gif
+from .image_ping import ImagePingResult
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +69,99 @@ class OpenAICompatibleImageClient:
     def _timeout(self, override: float | None = None) -> httpx.Timeout:
         total = self.timeout_seconds if override is None else max(5.0, override)
         return httpx.Timeout(total, connect=min(20.0, total))
+
+    async def ping(
+        self, *, timeout_seconds: int = 10, additional_models: tuple[str, ...] = ()
+    ) -> ImagePingResult:
+        """Probe the authenticated model list without submitting a generation."""
+        timeout_seconds = min(60, max(1, timeout_seconds))
+        started = time.monotonic()
+        try:
+            result = await asyncio.wait_for(
+                self._ping_models(timeout_seconds, additional_models), timeout_seconds
+            )
+        except (asyncio.TimeoutError, httpx.TimeoutException):
+            result = ImagePingResult(
+                "error", f"检测超时（上限 {timeout_seconds} 秒），请检查网络或稍后重试。"
+            )
+        except (httpx.InvalidURL, ValueError):
+            result = ImagePingResult("error", "生图 API 地址或请求配置无效，请检查设置。")
+        except httpx.HTTPError:
+            # URLs, response bodies and exception details can contain credentials.
+            result = ImagePingResult(
+                "error", "连接生图 API 失败，请检查网络、域名、代理及 TLS 证书。"
+            )
+        return replace(result, elapsed_ms=round((time.monotonic() - started) * 1000))
+
+    async def _ping_models(
+        self, timeout_seconds: int, additional_models: tuple[str, ...]
+    ) -> ImagePingResult:
+        async with (
+            httpx.AsyncClient(
+                headers=self._headers(),
+                timeout=httpx.Timeout(timeout_seconds, connect=min(5, timeout_seconds)),
+                follow_redirects=False,
+            ) as client,
+            client.stream("GET", f"{self.base_url}/models") as response,
+        ):
+            status = response.status_code
+            if not 200 <= status < 300:
+                level = "error"
+                if status in {401, 403}:
+                    message = "鉴权失败或无访问权限，请检查生图 Key、分组和 User-Agent。"
+                elif status == 429:
+                    message = "上游限流或额度不足，请稍后重试并检查账户额度。"
+                elif status in {404, 405}:
+                    level = "warning"
+                    message = (
+                        "接口已响应，但不支持模型列表检测；"
+                        "请核对 API 地址，鉴权与模型权限尚未确认。"
+                    )
+                elif 300 <= status < 400:
+                    level = "warning"
+                    message = "接口返回重定向，检测未跟随跳转；请将 API Base URL 配置为最终地址。"
+                elif status >= 500:
+                    message = "生图 API 上游服务异常，请稍后重试。"
+                else:
+                    message = "模型列表接口拒绝了请求，请检查 API 地址与网关配置。"
+                return ImagePingResult(level, message, http_status=status)
+
+            # Limit the accepted model-list payload, including decoded response bytes.
+            content = bytearray()
+            async for chunk in response.aiter_bytes(chunk_size=64 * 1024):
+                content.extend(chunk)
+                if len(content) > 1024 * 1024:
+                    return ImagePingResult(
+                        "warning", "模型列表响应超过 1MB，无法完成检测。", http_status=status
+                    )
+
+        try:
+            payload = json.loads(content)
+        except (ValueError, UnicodeDecodeError):
+            payload = None
+        rows = payload.get("data") if isinstance(payload, dict) else None
+        if (
+            not isinstance(rows, list)
+            or payload.get("error")
+            or any(not isinstance(row, dict) or not isinstance(row.get("id"), str) for row in rows)
+        ):
+            return ImagePingResult(
+                "warning",
+                "接口已响应，但未返回标准模型列表；"
+                "请检查 API 地址或网关兼容性，鉴权与模型权限尚未确认。",
+                http_status=status,
+            )
+        available = {row["id"] for row in rows}
+        models = {model: model in available for model in (self.model, *additional_models)}
+        listed = all(models.values())
+        return ImagePingResult(
+            "ok" if listed else "warning",
+            "模型列表接口访问成功，当前配置的模型均已列出。"
+            if listed
+            else "模型列表接口访问成功，但部分配置模型未列出；这不能单独判定实际生图失败。",
+            http_status=status,
+            models=models,
+        )
 
     @staticmethod
     def _error_detail(response: httpx.Response, *, operation: str = "", path: str = "") -> str:

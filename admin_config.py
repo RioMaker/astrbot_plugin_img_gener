@@ -75,7 +75,8 @@ class AdminConfig:
                 "safety.review_timeout_seconds": 5,
                 "safety.max_prompt_chars": 200,
             }.get(path, minimum)
-            valid = type(value) is int and minimum <= value <= 1000000
+            maximum = 60 if path == "api.ping_timeout_seconds" else 1000000
+            valid = type(value) is int and minimum <= value <= maximum
         elif kind in {"string", "text"}:
             valid = isinstance(value, str) and len(value) <= 32000 and "\x00" not in value
         elif kind in {"list", "file"}:

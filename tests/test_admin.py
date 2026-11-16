@@ -377,6 +377,59 @@ def test_api_rejects_cross_site_and_non_json_mutations(web_api):
     assert api.plugin.config.saved is None
 
 
+def test_ping_api_uses_saved_revision_and_allows_active_generation(web_api):
+    from astrbot_plugin_img_gener.image_ping import ImagePingResult
+
+    api, request = web_api
+    calls = []
+
+    async def probe():
+        calls.append(True)
+        return ImagePingResult("ok", "可访问", elapsed_ms=12, http_status=200)
+
+    api.plugin.ping_image_service = probe
+    api.plugin._active_jobs[1] = object()
+    before = copy.deepcopy(dict(api.plugin.config))
+    request.content = json.dumps({"revision": api.settings.revision()}).encode()
+    result = call(api, "settings/ping", "POST")
+    assert result["status"] == 200 and result["data"]["status"] == "ok"
+    assert "12 ms" in result["data"]["report"]
+    assert calls == [True]
+    assert dict(api.plugin.config) == before and api.plugin.config.saved is None
+    assert "private-generation-secret" not in json.dumps(result)
+
+    request.content = json.dumps({"revision": "stale"}).encode()
+    assert call(api, "settings/ping", "POST")["status"] == 409
+    request.content = json.dumps({"revision": api.settings.revision(), "api_key": "other"}).encode()
+    assert call(api, "settings/ping", "POST")["status"] == 400
+    request.content_type = "text/plain"
+    assert call(api, "settings/ping", "POST")["status"] == 415
+    request.content_type = "application/json"
+    request.headers = {"Sec-Fetch-Site": "cross-site"}
+    assert call(api, "settings/ping", "POST")["status"] == 403
+    assert calls == [True]
+
+
+@pytest.mark.parametrize("value", [0, 61, True, "10"])
+def test_ping_timeout_rejects_invalid_values(plugin, value):
+    settings = AdminConfig(plugin)
+    with pytest.raises(AdminError):
+        settings.save(
+            {"revision": settings.revision(), "changes": {"api": {"ping_timeout_seconds": value}}}
+        )
+    assert plugin.config.saved is None
+
+
+@pytest.mark.parametrize("value", [1, 10, 60])
+def test_ping_timeout_can_be_saved(plugin, value):
+    settings = AdminConfig(plugin)
+    result = settings.save(
+        {"revision": settings.revision(), "changes": {"api": {"ping_timeout_seconds": value}}}
+    )
+    assert result["values"]["api"]["ping_timeout_seconds"] == value
+    assert plugin.config.saved["api"]["ping_timeout_seconds"] == value
+
+
 def test_api_crud_preview_upload_and_bad_payloads(web_api):
     api, request = web_api
     record = add(api.plugin.gallery_store)

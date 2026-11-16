@@ -2,7 +2,7 @@
   "api": {
     "description": "生图 API",
     "type": "object",
-    "hint": "OpenAI-compatible Images API。默认使用 https://uuapi.cc/v1。",
+    "hint": "OpenAI-compatible Images API。默认使用 https://uuapi.cc/v1。可用 /生图ping 或「生图管理 → 插件设置 → 检测连通性」检查已保存配置。",
     "items": {
       "base_url": {
         "description": "API Base URL",
@@ -27,6 +27,12 @@
         "type": "int",
         "default": 300,
         "hint": "GPT Image 2 可能生成较久，建议不少于 180 秒。"
+      },
+      "ping_timeout_seconds": {
+        "description": "连通检测超时（秒）",
+        "type": "int",
+        "default": 10,
+        "hint": "/生图ping 与管理页检测共用，范围 1～60 秒，独立于生图超时。仅请求模型列表，不生成图片、不占生图额度。检测间隔至少 10 秒，连通不保证实际出图成功。"
       },
       "edit_image_field": {
         "description": "参考图上传字段",

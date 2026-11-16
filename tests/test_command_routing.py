@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from astrbot_plugin_img_gener.image_ping import ImagePingResult
 from command_routing_support import install_command_parser
 from test_gallery_command import GalleryEvent, add_image
 from test_main_background import _install_astrbot_stubs
@@ -65,6 +66,46 @@ def dispatch(plugin, command_filter, event):
         ]
 
     return asyncio.run(collect())
+
+
+def test_ping_dispatch_uses_probe_and_never_matches_generation_route(routed_plugin):
+    _module, plugin, registered = routed_plugin
+    plugin._is_allowed = lambda event: True
+    calls = []
+
+    async def probe():
+        calls.append(True)
+        return ImagePingResult("ok", "模型列表接口访问成功", elapsed_ms=42, http_status=200)
+
+    plugin.ping_image_service = probe
+    event = parsed_event(registered, "生图ping", "/生图ping")
+    assert event.extras["parsed_params"] == {}
+    assert not registered["生图"].filter(CommandEvent("/生图ping"), {})
+    assert not registered["生图ping"].filter(CommandEvent("/生图ping", awake=False), {})
+    replies = dispatch(plugin, registered["生图ping"], event)
+    assert len(replies) == 1 and "42 ms" in replies[0] and "HTTP 200" in replies[0]
+    assert "不生成图片" in replies[0] and event.stopped
+    assert calls == [True]
+
+
+@pytest.mark.parametrize(
+    "access",
+    [
+        {"enabled": False},
+        {"admin_only": True},
+        {"allowed_user_ids": ["other-user"]},
+        {"denied_group_ids": ["test-group"]},
+    ],
+)
+def test_ping_route_enforces_generation_access_before_probing(routed_plugin, access):
+    _module, plugin, registered = routed_plugin
+    plugin.config = {"access": access}
+    event = parsed_event(registered, "生图ping", "/生图ping")
+    event.is_admin = lambda: False
+    event.get_group_id = lambda: "test-group"
+    replies = dispatch(plugin, registered["生图ping"], event)
+    assert replies == ["当前会话或用户未获准使用生图功能。"]
+    assert event.stopped
 
 
 @pytest.mark.parametrize(

@@ -37,6 +37,7 @@ try:
     from .generation_history import GenerationHistoryRecord, GenerationHistoryStore
     from .gif_support import GifOptions, first_frame_png
     from .image_client import OpenAICompatibleImageClient
+    from .image_ping import ImagePingResult
     from .moderation import PromptModerator
     from .random_puzzle import build_random_puzzle, parse_puzzle_count, parse_puzzle_ids
     from .rate_limiter import LimitConfig, PersistentRateLimiter
@@ -62,6 +63,7 @@ except ImportError:  # pragma: no cover - direct script-style import fallback.
     from generation_history import GenerationHistoryRecord, GenerationHistoryStore
     from gif_support import GifOptions, first_frame_png
     from image_client import OpenAICompatibleImageClient
+    from image_ping import ImagePingResult
     from moderation import PromptModerator
     from random_puzzle import build_random_puzzle, parse_puzzle_count, parse_puzzle_ids
     from rate_limiter import LimitConfig, PersistentRateLimiter
@@ -246,6 +248,8 @@ class GPTImageGeneratorPlugin(Star):
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._active_jobs: dict[int, ActiveGenerationJob] = {}
         self._next_job_id = 0
+        self._ping_running = False
+        self._ping_last_started: float | None = None
         self.admin_api = register_admin_api(self)
 
     async def initialize(self) -> None:
@@ -826,6 +830,34 @@ class GPTImageGeneratorPlugin(Star):
                 self._get("api", "edit_image_field", default="image") or "image"
             ),
         )
+
+    async def ping_image_service(self) -> ImagePingResult:
+        """Shared read-only probe for chat and Dashboard, using saved configuration."""
+        if self._ping_running:
+            return ImagePingResult("warning", "已有生图 ping 检测进行中，请稍后重试。")
+        now = time.monotonic()
+        if self._ping_last_started is not None and now - self._ping_last_started < 10:
+            remaining = max(1, 10 - int(now - self._ping_last_started))
+            return ImagePingResult("warning", f"检测过于频繁，请 {remaining} 秒后重试。")
+        self._ping_running = True
+        self._ping_last_started = now
+        try:
+            client = self._client()
+            return await client.ping(
+                timeout_seconds=self._int("api", "ping_timeout_seconds", default=10, minimum=1),
+                additional_models=(
+                    str(
+                        self._get("animation", "model", default="gpt-image-2.6") or "gpt-image-2.6"
+                    ),
+                ),
+            )
+        except ConfigurationError as exc:
+            return ImagePingResult("error", exc.public_message)
+        except Exception:
+            logger.error("[img_gener] image ping failed unexpectedly")
+            return ImagePingResult("error", "检测失败，请检查生图 API 配置后重试。")
+        finally:
+            self._ping_running = False
 
     def _review_client(self) -> OpenAICompatibleImageClient:
         review_model = str(
@@ -1447,7 +1479,9 @@ class GPTImageGeneratorPlugin(Star):
 
     async def _remote_review(self, _event: AstrMessageEvent, prompt: str) -> str:
         timeout = self._float("safety", "review_timeout_seconds", default=45, minimum=5)
-        review_model = str(self._get("safety", "review_model", default="") or "").strip()
+        review_model = str(
+            self._get("safety", "review_model", default="") or ""
+        ).strip()
         if not review_model:
             raise ConfigurationError(
                 "启用 LLM 安全审核时必须配置独立的审核模型 ID。"
@@ -2682,6 +2716,16 @@ class GPTImageGeneratorPlugin(Star):
                 f"- {character.name}（别名：{aliases}；可用参考图：{usable} 张）"
             )
         yield event.plain_result("\n".join(lines))
+
+    @filter.command("生图ping")
+    async def ping_command(self, event: AstrMessageEvent):
+        """检测生图接口连通性与模型列表，不实际生成图片。"""
+        event.stop_event()
+        if not self._is_allowed(event):
+            yield event.plain_result("当前会话或用户未获准使用生图功能。")
+            return
+        result = await self.ping_image_service()
+        yield event.plain_result(result.report())
 
     @filter.command("生图状态", alias={"生图配额"})
     async def status_command(self, event: AstrMessageEvent):
