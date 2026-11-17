@@ -26,7 +26,7 @@
 
 将本仓库放入 AstrBot 的 `data/plugins/astrbot_plugin_img_gener`，或者在 AstrBot WebUI 的插件页通过仓库 URL/压缩包安装。插件管理器会读取 `requirements.txt` 安装 `httpx`。
 
-插件已包含根目录 `logo.png`，供 AstrBot 自动识别插件图标；内置生图管理页也使用相同 Logo。
+插件已包含根目录 `logo.png`（256×256 透明 PNG），供 AstrBot 自动识别插件图标；内置生图管理页也使用相同的小尺寸 Logo。
 
 ## GIF 动图（v0.3.5）
 

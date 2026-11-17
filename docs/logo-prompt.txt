@@ -1,6 +1,7 @@
 生成方式：内置 imagegen
 用途：GPT Image 2 安全生图插件 logo
-最终文件：logo.png（透明背景 PNG）
+最终文件：logo.png（256×256 透明背景 PNG）
+资源处理：将生成原图使用 Lanczos 等比缩小，保留 RGBA 透明通道并优化 PNG 压缩；管理页 assets/logo.png 使用相同文件内容。
 
 初次生成提示词
 
