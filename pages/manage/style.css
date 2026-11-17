@@ -106,13 +106,12 @@ aside {
   margin-top: 5px;
 }
 .brand-icon {
-  display: grid;
-  place-items: center;
+  display: block;
+  flex-shrink: 0;
   width: 40px;
   height: 40px;
-  background: var(--accent);
-  color: var(--surface);
-  font-size: 28px;
+  object-fit: contain;
+  background: #fff;
   border-radius: 12px;
 }
 nav {

@@ -1,5 +1,9 @@
 # AstrBot GPT Image 2 安全生图
 
+<p align="center">
+  <img src="./logo.png" alt="GPT Image 2 安全生图 Logo" width="160" />
+</p>
+
 这是一个让 AstrBot 的聊天 LLM 直接调用生图能力的插件。图片通过 [UUAPI](https://uuapi.cc/docs) 的 OpenAI-compatible Images API 生成，默认模型为 `gpt-image-2`。
 
 插件的目标不是“收到提示词就无条件出图”，而是把生图做成一条有边界、可控成本的链路：
@@ -21,6 +25,8 @@
 ## 安装
 
 将本仓库放入 AstrBot 的 `data/plugins/astrbot_plugin_img_gener`，或者在 AstrBot WebUI 的插件页通过仓库 URL/压缩包安装。插件管理器会读取 `requirements.txt` 安装 `httpx`。
+
+插件已包含根目录 `logo.png`，供 AstrBot 自动识别插件图标；内置生图管理页也使用相同 Logo。
 
 ## GIF 动图（v0.3.5）
 

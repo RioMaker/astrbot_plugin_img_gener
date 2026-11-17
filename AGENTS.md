@@ -300,6 +300,8 @@ API Key 可以填写为 `$环境变量名`，不要把真实密钥提交到 Git�
 
 ## 维护检查
 
+插件根目录的 `logo.png` 用于 AstrBot 插件图标；管理页通过 `./assets/logo.png` 加载同一 Logo 的副本，更新时须同步两份图片。管理页资源保持在 `pages/manage/` 内，不通过 `..` 引用插件根目录。
+
 修改插件后至少运行：
 
 ```powershell
